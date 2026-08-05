@@ -94,8 +94,67 @@ def create_app(state: AppState | None = None) -> FastAPI:
     app.include_router(ux_router)
 
     @app.get("/healthz")
-    def healthz() -> dict[str, str]:
-        return {"status": "ok", "milestone": "P0"}
+    def healthz() -> dict[str, Any]:
+        """Live health check.
+
+        The P0-era `{"status": "ok", "milestone": "P0"}` is
+        wrong now: the dev path is at M11. The endpoint
+        reports the real cluster state so a SRE probe or a
+        load balancer can decide whether the instance is
+        healthy.
+
+        ``status`` is one of:
+          * ``ok`` — API up, DB reachable, M0+ capabilities
+            registered, multi-tenant store connected.
+          * ``degraded`` — API up but at least one subsystem
+            is failing (e.g. DB down). The body lists the
+            failing checks.
+        """
+        checks: dict[str, Any] = {}
+        overall = "ok"
+        # 1. Capabilities registered (M0+).
+        try:
+            caps = state.coordinator._router._store.all()  # noqa: SLF001
+            n_caps = len(caps)
+            checks["capabilities"] = {
+                "status": "ok", "count": n_caps,
+            }
+            if n_caps == 0:
+                checks["capabilities"]["status"] = "fail"
+                overall = "degraded"
+        except Exception as e:  # noqa: BLE001
+            checks["capabilities"] = {"status": "fail", "error": str(e)}
+            overall = "degraded"
+        # 2. Tenant store (M6).
+        tenant_count = 0
+        try:
+            from orchestra.enterprise.isolation import IsolatingEventStore
+            store = IsolatingEventStore()
+            store.connect()
+            try:
+                tenant_count = len(store.list_tenants())
+                checks["tenants"] = {
+                    "status": "ok", "count": tenant_count,
+                }
+            finally:
+                store.close()
+        except Exception as e:  # noqa: BLE001
+            checks["tenants"] = {"status": "fail", "error": str(e)}
+            overall = "degraded"
+        # 3. Published cards (M5).
+        n_published = 0
+        if hasattr(state, "_registry"):
+            n_published = len(state._registry._by_version)  # noqa: SLF001
+        checks["published_cards"] = {"status": "ok", "count": n_published}
+        return {
+            "status": overall,
+            "version": "0.1.0-m11",
+            "milestone": "M11",
+            "checks": checks,
+            "tenant_count": tenant_count,
+            "capability_count": checks["capabilities"].get("count", 0),
+            "published_card_count": n_published,
+        }
 
     @app.get("/templates")
     def templates() -> dict[str, Any]:
