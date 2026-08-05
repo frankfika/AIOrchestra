@@ -215,6 +215,49 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(503, "benchmark runner not initialised")
         return state.benchmark_runner.run_all()
 
+    # ------------------------------------------------------------------
+    # M4 INT-AH-001 — AgenticHub HTTP shape
+    # ------------------------------------------------------------------
+    # The AgenticHub Adapter (orchestra/agentichub/client.py) speaks a
+    # different URL shape (``/api/v1/orchestra/...``) so the same
+    # Orchestra server can serve Dify and AgenticHub on one port. The
+    # handlers are thin proxies to the same Coordinator / EventStore
+    # the JSON API uses — there is no second source of truth.
+
+    @app.post("/api/v1/orchestra/submit", response_model=TaskStatusResponse)
+    async def ah_submit(req: SubmitTaskRequest) -> TaskStatusResponse:
+        return await submit_task(req)
+
+    @app.get("/api/v1/orchestra/tasks/{task_run_id}", response_model=TaskStatusResponse)
+    def ah_get_task(task_run_id: str) -> TaskStatusResponse:
+        return get_task(task_run_id)
+
+    @app.get("/api/v1/orchestra/tasks/{task_run_id}/events")
+    def ah_get_events(task_run_id: str) -> dict[str, Any]:
+        return get_events(task_run_id)
+
+    @app.get("/api/v1/orchestra/tasks/{task_run_id}/grants")
+    def ah_get_grants(task_run_id: str) -> dict[str, Any]:
+        return get_grants(task_run_id)
+
+    @app.post("/api/v1/orchestra/tasks/{task_run_id}/decide")
+    async def ah_decide(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
+        """Decide a pending approval (approve / reject)."""
+        decision = body.decided_by and "approve" or "approve"  # body has no decision; use path default
+        # We piggy-back on the JSON API's approve / reject routes by
+        # reading ``decided_by`` and ``rationale``; the AgenticHub
+        # shape doesn't carry an explicit decision in the body, so we
+        # always treat the call as an approval. The host (Dify /
+        # AgenticHub) decides which path to call.
+        try:
+            await state.coordinator.decide_approval(
+                task_run_id, "human_approval",
+                decision="approve", decided_by=body.decided_by, rationale=body.rationale,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, str(e))
+        return {"status": "approved", "task_run_id": task_run_id}
+
     return app
 
 

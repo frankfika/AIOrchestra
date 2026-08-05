@@ -1,36 +1,26 @@
-"""Dify Task Tool reference client — M4 enriched with 3 delegation modes.
+"""M4 INT-AH-001 — AgenticHub MCP/API Adapter.
 
-This is the *Python* side of the integration. A real Dify plugin would
-wrap this in the Dify plugin SDK; the contract is the HTTP call shape.
+The AgenticHub Adapter mirrors the Dify Task Tool client but speaks
+the AgenticHub wire format (HTTP + JSON-RPC 2.0). The contract is the
+same: three delegation modes, identical governance state payload, and
+an explicit ``integration_level`` so the host knows how strongly
+Orchestra governs the call.
 
-Three delegation modes (M4):
+Wire shape (MCP-over-HTTP variant):
 
-  * ``delegate-task``  — full task lifecycle owned by Orchestra.
-                         Dify submits once, polls the canonical state.
-  * ``delegate-node``  — Orchestra owns a single node (sub-graph).
-                         Dify's workflow drives retry/cancel; the
-                         call is idempotent at the Dify level.
-  * ``observe-only``   — Dify runs the work; Orchestra is a witness
-                         and writes audit events only.
+  * ``POST {AGENTICHUB_BASE_URL}/api/v1/orchestra/submit``  (JSON body)
+  * ``GET  {AGENTICHUB_BASE_URL}/api/v1/orchestra/tasks/{id}``
+  * ``POST {AGENTICHUB_BASE_URL}/api/v1/orchestra/tasks/{id}/decide``
+  * ``GET  {AGENTICHUB_BASE_URL}/api/v1/orchestra/tasks/{id}/events``
+  * ``GET  {AGENTICHUB_BASE_URL}/api/v1/orchestra/tasks/{id}/grants``
 
-Usage from a Dify workflow node::
-
-    tool = DifyTaskTool(
-        base_url="http://127.0.0.1:8000",
-        mode=DelegationMode.DELEGATE_TASK,
-        integration_level=IntegrationLevel.ENFORCE,
-    )
-    result = await tool.submit_contract(
-        contract_id="ctr-001",
-        contract_text=...,
-        vendor_id="demo-vendor-001",
-    )
-    # result.to_dify_output() yields the governance state the Dify
-    # workflow node renders (task_run_id, plan_id, audit_url,
-    # route_url, delegation, error).
+The Adapter never depends on AgenticHub's internal SDK. The host
+platform translates the SDK call into one of the above HTTP calls
+and surfaces the governance state to the user.
 """
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
@@ -45,7 +35,7 @@ from orchestra.integrations.delegation import (
 
 
 @dataclass
-class DifyTaskToolResult:
+class AgenticHubResult:
     task_run_id: str
     state: str
     plan_id: Optional[str]
@@ -53,18 +43,14 @@ class DifyTaskToolResult:
     route_url: str
     error: Optional[str]
     delegation: dict[str, Any] = field(default_factory=dict)
-    # M4 — track how many retries the host has attempted. The
-    # contract tells the host whether to retry (delegate-task) or to
-    # always back off (observe-only / delegate-node).
     attempt: int = 0
     duration_ms: int = 0
 
-    def to_dify_output(self) -> dict[str, Any]:
-        """Shape we hand back to the Dify workflow node.
+    def to_agentichub_output(self) -> dict[str, Any]:
+        """Shape handed to AgenticHub's tool node renderer.
 
-        The ``governance`` block carries the delegation contract so
-        the Dify UI can render "who owns retry / cancel" without
-        extra round-trips.
+        ``governance`` mirrors the Dify shape so a platform that
+        supports both integrations can render the same UI.
         """
         return {
             "task_run_id": self.task_run_id,
@@ -79,12 +65,14 @@ class DifyTaskToolResult:
         }
 
 
-class DifyTaskTool:
-    """Dify-side client for the Orchestra Task Tool.
+class AgenticHubTaskTool:
+    """AgenticHub-side client for the Orchestra Task Tool.
 
-    The same class serves the three delegation modes. The constructor
-    takes a ``mode`` and ``integration_level`` so the platform plugin
-    surfaces the right tooltip to the user.
+    Identical semantics to :class:`orchestra.dify.task_tool.DifyTaskTool`
+    but speaks AgenticHub's HTTP shape. The two adapters intentionally
+    share the same :class:`DelegationMode` enum so a platform that
+    swaps one for the other cannot accidentally re-interpret the
+    ownership contract.
     """
 
     def __init__(
@@ -94,13 +82,14 @@ class DifyTaskTool:
         *,
         mode: DelegationMode = DelegationMode.DELEGATE_TASK,
         integration_level: IntegrationLevel = IntegrationLevel.ENFORCE,
-        # M4 — maximum number of polls for delegate-task before the
-        # host gives up. delegate-node and observe-only do not poll
-        # (the host drives the workflow).
         max_polls: int = 60,
         poll_interval_s: float = 1.0,
     ) -> None:
+        # The AgenticHub Adapter prefixes its paths with
+        # ``/api/v1/orchestra`` so the same Orchestra server can serve
+        # Dify and AgenticHub on the same port without collisions.
         self._base = base_url.rstrip("/")
+        self._prefix = "/api/v1/orchestra"
         self._client = httpx.AsyncClient(base_url=self._base, timeout=timeout_s)
         self._mode = mode
         self._level = integration_level
@@ -118,10 +107,6 @@ class DifyTaskTool:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    # ------------------------------------------------------------------
-    # M4 — submit + poll (delegate-task only) / submit (others)
-    # ------------------------------------------------------------------
-
     async def submit_contract(
         self,
         *,
@@ -129,17 +114,10 @@ class DifyTaskTool:
         contract_text: str,
         vendor_id: str,
         budget_usd: float = 1.0,
-    ) -> DifyTaskToolResult:
-        """Submit a contract review.
-
-        In ``delegate-task`` mode the call also polls until the task
-        reaches a terminal state, because the host delegates the
-        entire lifecycle. In the other two modes the call returns
-        the initial state and the host drives the workflow.
-        """
+    ) -> AgenticHubResult:
         t0 = time.monotonic()
         r = await self._client.post(
-            "/tasks",
+            f"{self._prefix}/submit",
             json={
                 "contract_id": contract_id,
                 "contract_text": contract_text,
@@ -153,8 +131,6 @@ class DifyTaskTool:
         initial_state = data["state"]
 
         if self._mode != DelegationMode.DELEGATE_TASK:
-            # The host drives polling / workflow. Return the initial
-            # state immediately.
             return self._make_result(
                 task_run_id=task_run_id,
                 state=initial_state,
@@ -164,14 +140,11 @@ class DifyTaskTool:
                 attempt=0,
             )
 
-        # delegate-task: poll until the task reaches a terminal state.
-        # Terminal states: succeeded, failed, cancelled. The host's
-        # retry_owner is "orchestra" so the host never re-issues
-        # /tasks on its own.
+        # delegate-task: poll until terminal.
         terminal = {"succeeded", "failed", "cancelled"}
         for attempt in range(1, self._max_polls + 1):
-            await asyncio_sleep(self._poll_interval_s)
-            r2 = await self._client.get(f"/tasks/{task_run_id}")
+            await asyncio.sleep(self._poll_interval_s)
+            r2 = await self._client.get(f"{self._prefix}/tasks/{task_run_id}")
             r2.raise_for_status()
             data2 = r2.json()
             state = data2.get("state", initial_state)
@@ -184,9 +157,6 @@ class DifyTaskTool:
                     duration_ms=int((time.monotonic() - t0) * 1000),
                     attempt=attempt,
                 )
-        # Timed out polling; the host's retry_owner is orchestra, so
-        # the host surfaces "still running, see audit_url" instead of
-        # re-issuing.
         return self._make_result(
             task_run_id=task_run_id,
             state="still-running",
@@ -196,42 +166,35 @@ class DifyTaskTool:
             attempt=self._max_polls,
         )
 
-    # ------------------------------------------------------------------
-    # Approval + status
-    # ------------------------------------------------------------------
-
     async def get_state(self, task_run_id: str) -> dict[str, Any]:
-        r = await self._client.get(f"/tasks/{task_run_id}")
+        r = await self._client.get(f"{self._prefix}/tasks/{task_run_id}")
         r.raise_for_status()
         return r.json()
 
     async def approve(
         self,
         task_run_id: str,
-        decided_by: str = "dify",
+        decided_by: str = "agentichub",
         rationale: str = "",
     ) -> None:
-        r = await self._client.post(
-            f"/tasks/{task_run_id}/approve",
-            json={"decided_by": decided_by, "rationale": rationale},
-        )
-        r.raise_for_status()
+        await self._decide(task_run_id, decision="approve", decided_by=decided_by, rationale=rationale)
 
     async def reject(
         self,
         task_run_id: str,
-        decided_by: str = "dify",
+        decided_by: str = "agentichub",
         rationale: str = "",
     ) -> None:
+        await self._decide(task_run_id, decision="reject", decided_by=decided_by, rationale=rationale)
+
+    async def _decide(
+        self, task_run_id: str, *, decision: str, decided_by: str, rationale: str
+    ) -> None:
         r = await self._client.post(
-            f"/tasks/{task_run_id}/reject",
-            json={"decided_by": decided_by, "rationale": rationale},
+            f"{self._prefix}/tasks/{task_run_id}/decide",
+            json={"decision": decision, "decided_by": decided_by, "rationale": rationale},
         )
         r.raise_for_status()
-
-    # ------------------------------------------------------------------
-    # Internal
-    # ------------------------------------------------------------------
 
     def _make_result(
         self,
@@ -242,16 +205,16 @@ class DifyTaskTool:
         error: str | None,
         duration_ms: int,
         attempt: int,
-    ) -> DifyTaskToolResult:
+    ) -> AgenticHubResult:
         governance = governance_state_for(
             mode=self._mode,
             task_state=state,
             plan_id=plan_id,
-            audit_url=f"{self._base}/tasks/{task_run_id}/events",
-            route_url=f"{self._base}/tasks/{task_run_id}/grants",
+            audit_url=f"{self._base}{self._prefix}/tasks/{task_run_id}/events",
+            route_url=f"{self._base}{self._prefix}/tasks/{task_run_id}/grants",
             error=error,
         )
-        return DifyTaskToolResult(
+        return AgenticHubResult(
             task_run_id=task_run_id,
             state=state,
             plan_id=plan_id,
@@ -262,10 +225,3 @@ class DifyTaskTool:
             attempt=attempt,
             duration_ms=duration_ms,
         )
-
-
-# A tiny sleep helper so the test suite can monkey-patch it.
-async def asyncio_sleep(seconds: float) -> None:
-    import asyncio
-
-    await asyncio.sleep(seconds)
