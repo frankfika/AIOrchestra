@@ -1,0 +1,25 @@
+{{- if .Values.smokeTest.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "orchestra.fullname" . }}-smoketest
+  labels:
+    {{- include "orchestra.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        {{- include "orchestra.selectorLabels" . | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: smoketest
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          command: ["python", "-m", "orchestra.cli", "--base", "http://localhost:8000", "capabilities"]
+          # The job runs inside the cluster; the CLI hits the
+          # ClusterIP service through a sidecar proxy or by sharing
+          # the service network (networkPolicy permitting). For
+          # clean-room, the operator runs the test from outside the
+          # cluster.
+{{- end }}

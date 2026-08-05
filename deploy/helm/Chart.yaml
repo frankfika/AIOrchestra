@@ -1,0 +1,15 @@
+apiVersion: v2
+name: orchestra
+description: M4 OSS-001 — Orchestra Hybrid/Sovereign AI Orchestration Plane
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - ai-orchestration
+  - governance
+  - control-plane
+maintainers:
+  - name: Orchestra Authors
+home: https://github.com/frankfika/AIOrchestra
+sources:
+  - https://github.com/frankfika/AIOrchestra

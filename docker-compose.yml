@@ -1,0 +1,58 @@
+# M4 OSS-001 — Orchestra Docker Compose.
+#
+# Two services:
+#   * `postgres`  — PostgreSQL 16 for the Event Store.
+#   * `orchestra` — Orchestra API + demo console on :8000.
+#
+# The CLI is runnable via `docker compose run --rm orchestra-cli`.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestra
+      POSTGRES_PASSWORD: orchestra
+      POSTGRES_DB: orchestra
+    volumes:
+      - orchestra_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestra -d orchestra"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    ports:
+      # Exposed only on the host for the clean-room install test; in
+      # production the API reaches PG via the internal network.
+      - "127.0.0.1:5432:5432"
+
+  orchestra:
+    build: .
+    image: orchestra:dev
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://orchestra:orchestra@postgres:5432/orchestra
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  orchestra-cli:
+    image: orchestra:dev
+    depends_on:
+      orchestra:
+        condition: service_healthy
+    environment:
+      ORCHESTRA_BASE_URL: http://orchestra:8000
+    entrypoint: ["python", "-m", "orchestra.cli"]
+    profiles: ["cli"]
+
+volumes:
+  orchestra_pgdata:

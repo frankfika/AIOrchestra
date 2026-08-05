@@ -1,0 +1,54 @@
+# Default values for orchestra.
+# This is a YAML-formatted file.
+# Override per-release with `helm install orchestra ./deploy/helm -f myvalues.yaml`.
+
+image:
+  repository: orchestra
+  tag: dev
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: orchestra.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+resources:
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+env:
+  # DATABASE_URL is wired from secretRef (see secret.yaml).
+  PYTHONUNBUFFERED: "1"
+  LOG_LEVEL: info
+
+# External PostgreSQL config. The chart does NOT bundle a Postgres
+# deployment; the operator is expected to point at an existing
+# database (RDS / Cloud SQL / Crunchy / etc).
+postgres:
+  host: postgres
+  port: 5432
+  database: orchestra
+  user: orchestra
+  existingSecret: orchestra-postgres
+  existingSecretKey: password
+
+# Clean-room install requires a Job that runs `orchestra submit` once
+# to confirm the server is reachable. Disable for production releases.
+smokeTest:
+  enabled: true
