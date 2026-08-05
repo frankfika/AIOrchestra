@@ -121,6 +121,87 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# M11 — Doctor
+# ---------------------------------------------------------------------------
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Health check for ops. Probes the API, the capability set,
+    and the published cards. Returns 0 on green, 1 on any
+    non-fatal warning, 2 on a hard failure.
+
+    The doctor is the canonical "is the cluster up?" probe a
+    SRE runs in a PagerDuty runbook.
+    """
+    base = args.base.rstrip("/")
+    failures: list[str] = []
+    warnings: list[str] = []
+    checks: list[dict[str, Any]] = []
+
+    def _check(name: str, ok: bool, detail: str, *, warn: bool = False) -> None:
+        if ok:
+            checks.append({"name": name, "status": "ok", "detail": detail})
+        elif warn:
+            warnings.append(f"{name}: {detail}")
+            checks.append({"name": name, "status": "warn", "detail": detail})
+        else:
+            failures.append(f"{name}: {detail}")
+            checks.append({"name": name, "status": "fail", "detail": detail})
+
+    # 1. /healthz
+    try:
+        r = httpx.get(f"{base}/healthz", timeout=5.0)
+        if r.status_code == 200:
+            body = r.json()
+            _check("api_health", True, f"milestone={body.get('milestone', '?')}")
+        else:
+            _check("api_health", False, f"HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        _check("api_health", False, f"connect: {e}")
+
+    # 2. capabilities registered
+    try:
+        r = httpx.get(f"{base}/capabilities", timeout=5.0)
+        if r.status_code == 200:
+            data = r.json()
+            n = len(data.get("manifests", []))
+            if n == 0:
+                _check("capabilities", False, "no capabilities registered")
+            else:
+                _check("capabilities", True, f"{n} capabilities registered")
+        else:
+            _check("capabilities", False, f"HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        _check("capabilities", False, f"connect: {e}")
+
+    # 3. published cards (best-effort)
+    try:
+        r = httpx.get(f"{base}/admin/publish", timeout=5.0)
+        if r.status_code == 200:
+            data = r.json()
+            n = len(data.get("cards", []))
+            _check("published_cards", n > 0, f"{n} cards", warn=False) if n > 0 else _check(
+                "published_cards", True, f"{n} cards (no published capabilities yet)", warn=True
+            )
+        else:
+            _check("published_cards", False, f"HTTP {r.status_code}")
+    except Exception as e:  # noqa: BLE001
+        _check("published_cards", False, f"connect: {e}")
+
+    _print_json({
+        "base": base,
+        "checks": checks,
+        "failures": failures,
+        "warnings": warnings,
+    })
+    if failures:
+        return 2
+    if warnings:
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # M8 — Tenant admin subcommands
 # ---------------------------------------------------------------------------
 
@@ -241,6 +322,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("capabilities", help="List registered capabilities")
     s.set_defaults(func=cmd_capabilities)
+
+    s = sub.add_parser("doctor", help="Health check (SRE runbook probe)")
+    s.set_defaults(func=cmd_doctor)
 
     # --- M8: Tenant admin -------------------------------------------------
     s = sub.add_parser("tenant", help="Tenant admin operations")
