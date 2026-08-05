@@ -42,13 +42,18 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         )
         return HTMLResponse(render_layout(role="business", title="Business", body_html=body, current_path="/"))
 
-    @router.post("/tasks")
+    @router.post("/ux/tasks")
     async def submit_task(
         contract_id: str = Form(...),
         vendor_id: str = Form(...),
         contract_text: str = Form(...),
         budget_usd: float = Form(2.0),
     ):
+        """HTML-form submission entry for the Demo Console.
+
+        Mounted at /ux/tasks so the JSON API's POST /tasks keeps its
+        contract (returns a 200 + JSON body, not a 303 redirect).
+        """
         state = state_provider()
         from orchestra.core.ids import new_id
         from orchestra.core.schema import (
@@ -82,7 +87,7 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         state._background_runs[task_run_id] = asyncio.create_task(run)
         return RedirectResponse(url=f"/platform/{task_run_id}", status_code=303)
 
-    @router.post("/tasks/{task_run_id}/approve")
+    @router.post("/ux/tasks/{task_run_id}/approve")
     async def approve_from_console(
         task_run_id: str, decision: str = Form(...), decided_by: str = Form("console-user"), rationale: str = Form(""),
     ):
@@ -151,13 +156,13 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
             body += f"""
 <section class="card">
   <h2>Decide Approval</h2>
-  <form method="post" action="/tasks/{task_run_id}/approve">
+  <form method="post" action="/ux/tasks/{task_run_id}/approve">
     <label>Rationale <input name="rationale" value="looks good" /></label>
     <label>Decided by <input name="decided_by" value="console-user" /></label>
     <input type="hidden" name="decision" value="approve" />
     <button type="submit">Approve</button>
   </form>
-  <form method="post" action="/tasks/{task_run_id}/approve">
+  <form method="post" action="/ux/tasks/{task_run_id}/approve">
     <input type="hidden" name="decision" value="reject" />
     <input type="hidden" name="rationale" value="rejected from console" />
     <input type="hidden" name="decided_by" value="console-user" />

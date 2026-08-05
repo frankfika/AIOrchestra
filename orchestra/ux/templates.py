@@ -113,7 +113,7 @@ def render_layout(*, role: str, title: str, body_html: str, current_path: str) -
 def render_business_view(*, contract: str, vendor_id: str, task_run_id: str | None, task_state: str | None, node_results: dict) -> str:
     if task_run_id is None:
         form = f"""
-<form method="post" action="/tasks">
+<form method="post" action="/ux/tasks">
   <label>Contract ID
     <input name="contract_id" value="{_esc(contract)}" />
   </label>

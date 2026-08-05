@@ -42,8 +42,9 @@ def test_ux_home_renders_business_form():
     body = r.text
     assert "Orchestra M3 Demo Console" in body
     assert "Submit Contract Review" in body
-    # The form must POST to /tasks.
-    assert 'action="/tasks"' in body
+    # The form must POST to /ux/tasks (the UX-only path; the JSON
+    # API keeps a clean POST /tasks for Dify / AgenticHub).
+    assert 'action="/ux/tasks"' in body
     # FieldManifest / Egress references in the footer (so the page
     # advertises what the demo is for).
     assert "M3 Governed Hybrid E2E" in body
