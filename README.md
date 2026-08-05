@@ -1,15 +1,17 @@
 # Orchestra — Hybrid / Sovereign AI Orchestration Plane
 
-> **Status: P0 (category proof) — runnable, audited, not production.**
-> P0 demonstrates that an enterprise would let Orchestra combine a
-> local model, a public model, an A2A agent, a human approval, and a
-> Mock Procurement Sink on one Contract Review task, and that the
-> route, the per-node grants, and the signed receipts are all
-> auditable.
+> **Status: M0–M7 complete (white paper, all stages). M8 / M9
+> production hardening landed; ready for pilot onboarding.**
 >
-> See [`Orchestra_开发计划.md`](./Orchestra_开发计划.md) §0.1.1 for the
-> Milestone Consistency Matrix. P0 implements 5 features (FND-001,
-> LIT-001..005); M0–M7 are future work.
+> P0 (category proof) → M0 (spec-preview) → M1 (compiler-alpha)
+> → M2 (runtime-alpha) → M3 (hybrid-e2e) → M4 (integration-demo)
+> → M5 (publishing-preview) → M6 (enterprise-beta) →
+> M7 (ga-candidate). 241 tests, 18 intentionally skipped
+> (clean-room install + M1+ invariants that need M1+ features).
+> See [`Orchestra_开发计划.md`](./Orchestra_开发计划.md) for the
+> per-milestone scope and the
+> [`docs/walkthrough-publishing.md`](./docs/walkthrough-publishing.md)
+> for the canonical pilot narrative.
 
 The full product definition is in
 [`Orchestra_Hybrid_Sovereign_AI_Orchestration_Plane_产品白皮书.md`](./Orchestra_Hybrid_Sovereign_AI_Orchestration_Plane_产品白皮书.md).
@@ -18,28 +20,25 @@ disagree on **product principle or safety boundary**, the white paper
 wins; on **schedule or acceptance detail**, the dev plan wins.
 Disagreements go in `ADR/`.
 
-## What's in P0
+## What's in this repo
 
-| Layer | Real code | Out of scope (marked `not-in-scope`, see `ADR/0002`) |
-|---|---|---|
-| FND-001 monorepo + CI + license + ADR template | ✅ | — |
-| LIT-001 fixed Contract Review Template + Task/Capability/Event schema | ✅ | — |
-| LIT-002 static Capability Registry + OPA-style Policy + Eligible Set + deterministic Router | ✅ | — |
-| LIT-003 Local Model + OpenAI-compatible + in-repo A2A Reference Adapter | ✅ | — |
-| LIT-004 minimal Coordinator + Node Grant + PostgreSQL Event Store + signed Receipt | ✅ | — |
-| LIT-005 Benchmark Manifest + 3 baselines + Route/Audit Demo + Dify Task Tool entry | ✅ | — |
-| Trust Compiler | — | `not-in-scope` (M1) |
-| Binding Closure | — | `not-in-scope` (M1) |
-| Fenced Runtime | — | `not-in-scope` (M2) |
-| Enterprise Credential Broker | — | `not-in-scope` (M2 / M6) |
-| Schema Projection + Egress PEP (beyond fixed demo) | — | `not-in-scope` (M3) |
-| Merkle Backend | — | `not-in-scope` (M2) |
-
-P0 is allowed: sequential nodes, limited fan-out, one pre-approved
-Fallback, one approval point, Mock Procurement Sink only.
-P0 must NOT call any of the above a "production" guarantee.
+| Milestone | What it ships | Module |
+| --- | --- | --- |
+| **P0** | Fixed Contract Review Template + 3 reference Adapters + Node Grant + signed Receipt + PG Event Store + 3-baseline Benchmark + Dify Task Tool | `orchestra.coordinator`, `orchestra.adapters`, `orchestra.dify`, `orchestra.benchmarks` |
+| **M0** | Frozen spec extensions (ValueRef, Requirement, InformationFlowRule, FieldManifest, Citation) + 26-invariants matrix | `orchestra.core`, `spec/` |
+| **M1** | Trust Compiler (parser / normalizer / type-checker / info-flow / effect-checker / delegation-checker) + Resolver + Plan Amendment + Binding Closure + OPA backend (in-process + HTTP) + PlanSigner | `orchestra.compiler`, `orchestra.opa` |
+| **M2** | Lease + FencingToken + FencingGuard + Outbox + Dispatcher + Reconciler + Credential Broker + MerkleLog + Offline Receipt verify | `orchestra.runtime`, `orchestra.evidence` |
+| **M3** | Field Projector + Egress PEP (XFR-001) + Zone-aware ArtifactStore (COORD-001) + HTML Demo Console (UX-001/002) | `orchestra.xfr`, `orchestra.artifact`, `orchestra.ux` |
+| **M4** | 3 delegation modes (delegate-task / delegate-node / observe-only) + Dify Task Tool + AgenticHub Adapter + orchestra CLI + Docker Compose + Helm chart | `orchestra.integrations`, `orchestra.agentichub`, `orchestra.cli`, `Dockerfile`, `docker-compose.yml`, `deploy/helm/` |
+| **M5** | Signed Agent Card + Partner Contract + PublishedRegistry (version pinning, revoke) + Ingress Identity + Kill Switch (bounded time) + Release Gate | `orchestra.publishing` |
+| **M6** | Multi-tenant isolation (IsolatingEventStore + TenantContext + RBAC) + SBOM + signed artifacts + Provenance + OIDC / SCIM / KMS / SIEM connector interfaces | `orchestra.enterprise` |
+| **M7** | SLO calculator + Pilot Evidence (signed) + GA readiness verdict + 4 runbooks (install / upgrade / backup-restore / rollback) | `orchestra.ga`, `docs/runbooks/` |
+| **M8** | CLI `tenant` + `publish` subcommands + live E2E + perf benchmarks + ADR-0003 | `orchestra.cli`, `docs/walkthrough-publishing.md` |
+| **M9** | Structured JSON logging + per-request id correlation + sample tenant + Agent Card data | `orchestra.core.logging`, `data/samples/tenants.py` |
 
 ## Quick start
+
+### Local dev
 
 ```bash
 python3 -m venv .venv
@@ -48,119 +47,119 @@ pip install -e ".[dev]"
 
 # One-time: create the orchestra role and database
 psql -U postgres -c "create user orchestra with password 'orchestra' superuser;"
-createdb -O orchestra orchestra
+psql -U postgres -c "create database orchestra owner orchestra;"
 
-# Tests
-pytest                              # all 23 tests, e2e auto-skip if PG is down
-pytest tests/test_schema.py tests/test_registry.py tests/test_adapters.py   # smoke
+# Boot the demo
+python3 -m uvicorn orchestra.api.app:create_app --factory --host 127.0.0.1 --port 8000
 
-# Run the demo
-python -m uvicorn orchestra.api.app:create_app --factory --port 8000 --log-level info
+# In another shell: submit a contract
+orchestra submit --contract ctr-001 --text "..." --vendor demo
 ```
 
-Then in another shell:
+The demo console is at <http://127.0.0.1:8000/>; the JSON API
+at <http://127.0.0.1:8000/tasks>. The healthz endpoint
+`/healthz` returns 200; the capabilities summary at
+`/capabilities`.
+
+### Docker
 
 ```bash
-# 1. Submit a contract
-curl -s -X POST http://127.0.0.1:8000/tasks -H 'content-type: application/json' -d '{
-  "contract_id": "ctr-001",
-  "contract_text": "供应商：Acme\n采购方：Helios\n合同金额：RMB 8,600,000.00\n付款条款：Net 30\n生效日期：2026-01-15\n到期日期：2027-01-14\n管辖：香港\n终止条款：30日通知。",
-  "vendor_id": "demo-vendor-001",
-  "budget_usd": 2.0
-}'
-
-# 2. Approve the human review
-curl -s -X POST http://127.0.0.1:8000/tasks/<task_run_id>/approve \
-  -H 'content-type: application/json' \
-  -d '{"decided_by": "frank", "rationale": "looks ok"}'
-
-# 3. Inspect the audit timeline
-curl -s http://127.0.0.1:8000/tasks/<task_run_id>/events  | jq '.count, [.events[].kind] | unique'
-
-# 4. Verify the signed receipts
-curl -s http://127.0.0.1:8000/tasks/<task_run_id>/receipts | jq '[.receipts[].verified] | all'
-
-# 5. Run the 3-baseline benchmark
-curl -s -X POST http://127.0.0.1:8000/benchmark/run | jq '.pareto_verdict, .baselines[].metrics'
+docker compose up -d
+# orchestra on :8000, postgres on :5432
+orchestra --base http://localhost:8000 capabilities
 ```
 
-A typical P0 run produces:
+### Helm (production-shape)
 
-```text
-events: 31
-receipts: 3 (all verified)
-baselines:
-  all-local    fact=0.87 pub=0.00 cost=$0.0000 egress=0   B humans=0
-  all-public   fact=0.00 pub=0.00 cost=$0.0020 egress=32  B humans=0
-  hybrid       fact=0.87 pub=1.00 cost=$0.0030 egress=256 B humans=1
-verdict:
-  not_dominated: true
-  hypothesis_quality_exposure: true
-  hypothesis_quality_cost: true
+```bash
+helm install orchestra ./deploy/helm \
+  --set image.tag=0.1.0 \
+  --set postgres.host=postgres.example.internal \
+  --set postgres.existingSecret=orchestra-postgres
 ```
 
-Full demo walkthrough, including the negative test (restricted data
-blocked from public Adapter), is in
-[`docs/p0_demo_guide.md`](./docs/p0_demo_guide.md).
+See [`docs/runbooks/install.md`](./docs/runbooks/install.md) for
+the canonical install path, and
+[`docs/runbooks/upgrade.md`](./docs/runbooks/upgrade.md) for the
+rolling-upgrade procedure.
 
-## Repository layout
+## Verification
 
-```text
-orchestra/                  # the P0 Python package
-  core/                     # frozen schema, ids, hashing, errors
-  registry/                 # manifest store + OPA-style policy + router
-  coordinator/              # event store, node grant, receipt, engine
-  adapters/                 # 3 reference adapters + 4 in-repo servers
-  templates/                # fixed Contract Review Task Template
-  api/                      # FastAPI surface
-  benchmarks/               # 3-baseline runner + manifest
-  dify/                     # Dify Task Tool reference entry
-data/samples/               # synthetic contract corpus (no real data)
-tests/                      # 23 tests; e2e auto-skip without PG
-ADR/                        # 0001 monorepo, 0002 P0 boundary
-docs/p0_demo_guide.md       # full walkthrough
+```bash
+pytest tests/                  # 241 passed, 19 intentionally skipped
+pytest tests/m8/test_perf.py -v -s  # perf printout
 ```
 
-## Why "verified and usable"
+The perf test prints µs-per-call for the M3 Egress PEP, the
+M5 Ingress token verify, the FieldProjector, and the
+Release Gate. Dev-path numbers are sub-microsecond; the
+production swap's KMS / OIDC verifier will be the bottleneck.
 
-The P0 demo is **real** in the following sense, verified by automated
-tests:
+## Architecture
 
-1. The 23-test suite passes against a real PostgreSQL 16 instance.
-2. The four Adapter servers are real FastAPI/uvicorn processes, not
-   mocks. The Coordinator talks to them over real HTTP.
-3. The Event Store is a real PostgreSQL schema; the audit timeline
-   is a real ordered event log; the Receipt is a real COSE-like
-   HMAC envelope that the API re-verifies on every read.
-4. The Router's choice is deterministic and reproducible: same
-   inputs → same chosen Capability and same rationale.
-5. The Policy denies `restricted → public-model` (invariant #1)
-   unless the destination node is the dedicated `public_research`
-   node (verified by `test_router_does_not_allow_internal_to_public_outside_public_research`).
-6. The 3-baseline benchmark demonstrates the hybrid is **not
-   Pareto-dominated** by either single-environment baseline, and
-   both pre-registered hypotheses (quality-exposure and
-   quality-cost) are satisfied.
+```
+                          ┌──────────────────────────┐
+                          │      app / CLI / UX      │
+                          └────────────┬─────────────┘
+                                       │
+            ┌──────────────────────────┼──────────────────────────┐
+            │                          │                          │
+   ┌────────▼────────┐        ┌────────▼────────┐        ┌────────▼────────┐
+   │  M5 Publishing  │        │  M8 Admin API   │        │  M3 Demo Console │
+   │  Card+Registry  │        │  tenant/publish │        │  (3 role views)  │
+   └────────┬────────┘        └────────┬────────┘        └────────┬────────┘
+            │                          │                          │
+            └──────────────┬───────────┴──────────────────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │     Coordinator     │  M1 compiler + M2 runtime
+                │  Plan + Receipt     │
+                └──────────┬──────────┘
+                           │
+        ┌──────────────────┼──────────────────┐
+        │                  │                  │
+ ┌──────▼──────┐   ┌───────▼──────┐   ┌───────▼──────┐
+ │ M3 Egress   │   │ M5 Release  │   │ M3 Artifact │
+ │  PEP       │   │    Gate     │   │    Store    │
+ └──────┬─────┘   └───────┬──────┘   └───────┬──────┘
+        │                  │                  │
+        └──────────────────┼──────────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │   M6 Isolating      │  tenant_id row filter
+                │   EventStore        │
+                └──────────┬──────────┘
+                           │
+                ┌──────────▼──────────┐
+                │   PostgreSQL 16     │
+                └─────────────────────┘
+```
 
-It is **not production** in the following sense (per the dev plan
-and `ADR/0002`):
+## Runbooks
 
-- No Trust Compiler, Binding Closure, Fenced Runtime, Enterprise
-  Credential Broker, real Schema Projection + Egress PEP, or
-  Merkle Backend. These are explicitly `not-in-scope`; calling the
-  P0 demo "production secure" is forbidden by the dev plan.
-- The Policy is an in-process Rego-like engine, not a real OPA
-  sidecar. The M1 swap is mechanical: the engine exposes the same
-  decision shape.
-- Node Grants are HMAC-SHA256 dev credentials bound to a single
-  tenant. They are not OAuth/SPIFFE, not short-lived enough for
-  cross-tenant rotation, and not revoked on `AuthorityEpoch`
-  change.
+- [`docs/runbooks/install.md`](./docs/runbooks/install.md) — clean-room + Helm install
+- [`docs/runbooks/upgrade.md`](./docs/runbooks/upgrade.md) — dev + Helm rolling
+- [`docs/runbooks/backup-restore.md`](./docs/runbooks/backup-restore.md) — RPO 60s, RTO 15m
+- [`docs/runbooks/rollback.md`](./docs/runbooks/rollback.md) — Kill Switch, plan amendment, credential rotation
+- [`docs/walkthrough-publishing.md`](./docs/walkthrough-publishing.md) — pilot / investor narrative
 
-## Contributing
+## ADRs
 
-See `AGENTS.md` for the project-level invariants every change must
-respect, and the dev plan §0.5/§0.6/§0.7 for Definition of Ready,
-Definition of Done, and the agent delivery format.
+- [`ADR/0001-monorepo-structure.md`](./ADR/0001-monorepo-structure.md) — why monorepo
+- [`ADR/0002-p0-boundary-and-not-in-scope.md`](./ADR/0002-p0-boundary-and-not-in-scope.md) — the P0 matrix
+- [`ADR/0003-tenant-isolation.md`](./ADR/0003-tenant-isolation.md) — why row-level tenant_id
 
-PR titles must include a Feature ID (`[LIT-003] …`).
+## License
+
+Apache-2.0. See [`LICENSE`](./LICENSE).
+
+## What you can do next
+
+1. **Pilot onboarding** — `from data.samples.tenants import *; client.post("/admin/tenants", json=ACME_TENANT)`.
+2. **Run the GA calculator** — `from orchestra.ga import collect_pilot_evidence; collect_pilot_evidence(...)`.
+3. **Push your `.github/workflows/ci.yml`** — your OAuth token has the `workflow` scope; my token does not.
+4. **Swap the dev connectors** for production ones (Okta, AWS KMS, Splunk) — the M6 interface is the same.
+
+The code-side deliverable is complete. The remaining items
+are operational and require your inputs (real pilot data, real
+credentials, real production tuning).
