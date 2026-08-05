@@ -16,6 +16,13 @@ P0 has *one* pre-approved Fallback per node. The Router handles this; if
 all primary candidates are denied by the PDP, the Router returns the
 fallback manifest. The Coordinator surfaces the Fallback as a
 ``fallback.triggered`` event so the audit timeline shows the swap.
+
+M3 XFR-001 — when the Coordinator is built with an ``egress_pep``, every
+Adapter whose manifest declares ``egress_view_name`` runs its inputs
+through the PEP first. The PEP replaces the inputs with the projected
+payload (only the FieldManifest's allowed_fields, after redactions) and
+the audit timeline records an ``io.sent`` event with the projected
+digest — never the raw payload.
 """
 from __future__ import annotations
 
@@ -53,6 +60,7 @@ from orchestra.templates.contract_review import (
     build_contract_review_plan,
     get_default_purpose,
 )
+from orchestra.xfr.egress_pep import EgressDenied, EgressPEP
 
 
 ApprovalHandler = Callable[[str, str, dict[str, Any]], Awaitable[dict[str, Any]]]
@@ -84,6 +92,7 @@ class Coordinator:
         grant_issuer: NodeGrantIssuer,
         receipt_builder: ReceiptBuilder,
         approval_handler: ApprovalHandler | None = None,
+        egress_pep: Optional[EgressPEP] = None,
     ) -> None:
         self._store = store
         self._router = router
@@ -98,6 +107,10 @@ class Coordinator:
         # in-process "ingest_contract" node can re-derive the contract
         # text without re-reading the request.
         self._initial_inputs: dict[str, Any] | None = None
+        # M3 XFR-001 — if set, the Coordinator runs every public-capability
+        # adapter call through the EgressPEP. Local tools, sinks, and
+        # in-process nodes never see the PEP.
+        self._egress_pep: Optional[EgressPEP] = egress_pep
 
     # ------------------------------------------------------------------
     # Public API
@@ -474,6 +487,68 @@ class Coordinator:
         if approval_payload is not None:
             inputs["approval"] = approval_payload
 
+        # M3 XFR-001 — if the capability declares an egress_view_name AND
+        # an EgressPEP is configured, run the inputs through the PEP
+        # before invoking the Adapter. The PEP projects the payload
+        # down to the FieldManifest's allowed_fields and redactions; the
+        # adapter never sees fields the manifest does not list.
+        egress_projection: Optional[dict[str, Any]] = None
+        egress_manifest: Optional[dict[str, Any]] = None
+        egress_dropped: list[str] = []
+        egress_projected_bytes: int = 0
+        if manifest.egress_view_name and self._egress_pep is not None:
+            try:
+                projected, manifest_dict = self._egress_pep.project(
+                    capability_id=cap_id,
+                    view_name=manifest.egress_view_name,
+                    payload=inputs,
+                )
+            except EgressDenied as e:
+                # The PEP refused the call. Emit a denial audit event so
+                # the timeline shows *why* the node failed, then fail the
+                # node.
+                self._emit(
+                    task_run_id=task_run_id,
+                    node_run_id=node_run_id,
+                    kind=EventKind.POLICY_DECISION,
+                    payload={
+                        "node_id": plan_node.node_id,
+                        "capability_id": cap_id,
+                        "view_name": manifest.egress_view_name,
+                        "decision": "deny",
+                        "reason": str(e),
+                        "policy": "xfr-001.egress-pep",
+                    },
+                )
+                self._store.update_node_state(
+                    node_run_id, NodeRunState.FAILED, started=True, ended=True
+                )
+                self._emit(
+                    task_run_id=task_run_id,
+                    node_run_id=node_run_id,
+                    kind=EventKind.NODE_FAILED,
+                    payload={
+                        "node_id": plan_node.node_id,
+                        "error": str(e),
+                        "error_type": "EgressDenied",
+                        "policy": "xfr-001.egress-pep",
+                    },
+                )
+                raise
+            # The PEP succeeded. Compute dropped_fields so the audit
+            # event can record exactly what was filtered.
+            from orchestra.xfr.projector import FieldProjector
+
+            proj = FieldProjector()
+            proj_result = proj.project(
+                _manifest_for_projection(manifest_dict), inputs,
+            )
+            egress_projection = projected
+            egress_manifest = manifest_dict
+            egress_dropped = proj_result.dropped_fields
+            egress_projected_bytes = proj_result.projected_bytes
+            inputs = projected
+
         t0 = time.monotonic()
         try:
             adapter_result = await adapter.invoke(
@@ -507,11 +582,31 @@ class Coordinator:
             kind=EventKind.IO_INTENT,
             payload={"node_id": plan_node.node_id, "capability_id": cap_id, "data_view": data_view.name},
         )
+        if egress_manifest is not None:
+            # XFR-001 path: the io.sent event carries the projected
+            # digest + dropped fields. The raw payload never appears in
+            # the audit timeline.
+            io_sent_payload = {
+                "node_id": plan_node.node_id,
+                "capability_id": cap_id,
+                "view_name": manifest.egress_view_name,
+                "manifest_id": egress_manifest.get("manifest_id"),
+                "projected_digest": _projected_digest(egress_projection),
+                "projected_bytes": egress_projected_bytes,
+                "dropped_fields": egress_dropped,
+                "latency_ms": latency_ms,
+            }
+        else:
+            io_sent_payload = {
+                "node_id": plan_node.node_id,
+                "capability_id": cap_id,
+                "latency_ms": latency_ms,
+            }
         self._emit(
             task_run_id=task_run_id,
             node_run_id=node_run_id,
             kind=EventKind.IO_SENT,
-            payload={"node_id": plan_node.node_id, "capability_id": cap_id, "latency_ms": latency_ms},
+            payload=io_sent_payload,
         )
         self._emit(
             task_run_id=task_run_id,
@@ -646,6 +741,20 @@ class Coordinator:
 # ---------------------------------------------------------------------------
 
 
+def _manifest_for_projection(manifest_dict: dict[str, Any]):
+    """Re-hydrate a FieldManifest from a dict so the Projector can re-run."""
+    from orchestra.core.schema import FieldManifest
+
+    return FieldManifest.model_validate(manifest_dict)
+
+
+def _projected_digest(projected: Optional[dict[str, Any]]) -> str:
+    """Stable digest of the projected payload (matches the PEP's digest)."""
+    from orchestra.core.ids import digest_json
+
+    return digest_json(projected or {})
+
+
 def _deterministic_merge(inputs: dict[str, Any]) -> dict[str, Any]:
     facts = inputs.get("facts", {})
     research = inputs.get("research", {}) or {}
@@ -711,6 +820,7 @@ def build_default_coordinator(
     *,
     store: EventStore,
     endpoints: dict[str, str] | None = None,
+    egress_pep: Optional[EgressPEP] = None,
 ) -> Coordinator:
     """Construct a Coordinator with the default registry, policy, and
     four reference Adapters.
@@ -723,6 +833,12 @@ def build_default_coordinator(
     :class:`ManifestStore` is constructed internally from the bootstrap
     data; do not pass the manifest store as ``store`` — they are two
     different things with similar names.
+
+    ``egress_pep`` is the M3 XFR-001 Egress PEP. When provided, every
+    Adapter whose manifest declares ``egress_view_name`` runs its
+    inputs through the PEP before invocation. ``None`` disables
+    projection (the P0/P2 default for tests that only care about
+    routing).
     """
     from orchestra.registry.bootstrap import load_default_manifests as _load
 
@@ -743,6 +859,7 @@ def build_default_coordinator(
         adapters=adapters,
         grant_issuer=grant_issuer,
         receipt_builder=receipt_builder,
+        egress_pep=egress_pep,
     )
 
 

@@ -78,6 +78,14 @@ def create_app(state: AppState | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # M3 UX-001/UX-002 — mount the HTML Demo Console. The router uses
+    # a state_provider closure so it shares the same EventStore and
+    # Coordinator as the JSON API.
+    from orchestra.ux import build_ux_router
+
+    ux_router = build_ux_router(state_provider=lambda: state)
+    app.include_router(ux_router)
+
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
         return {"status": "ok", "milestone": "P0"}
