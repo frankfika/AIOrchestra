@@ -118,6 +118,20 @@ def load_default_manifests(endpoints: dict[str, str] | None = None) -> ManifestS
             p95_latency_ms=150,
             tags={"synthetic_only": "true"},
         ),
+        CapabilityManifest(
+            capability_id="tool.contract-passthrough",
+            name="Contract passthrough tool (in-process)",
+            kind=CapabilityKind.TOOL,
+            endpoint="inproc:contract-passthrough",
+            integration_level=IntegrationLevel.ENFORCE,
+            accepts_labels=[restricted_label, internal_label, public_label],
+            produces_labels=[internal_label],
+            declared_effects=[Effect(kind=EffectKind.READ)],
+            cost_estimate_usd=0.0,
+            p50_latency_ms=5,
+            p95_latency_ms=20,
+            tags={"purpose": "lift the contract text from initial_inputs into the node_results bus"},
+        ),
     ]
     return ManifestStore(manifests)
 

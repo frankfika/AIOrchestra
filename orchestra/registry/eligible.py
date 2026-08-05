@@ -96,9 +96,10 @@ def compute_eligible_set(
     for manifest in store.all():
         if manifest.kind not in node.eligible_capability_kinds:
             continue
-        if manifest.capability_id == node.fallback_capability_id:
+        if manifest.capability_id == node.fallback_capability_id and len(node.eligible_capability_kinds) > 1:
             # Fallback lives in a separate slot in the Plan; not eligible as
-            # the primary.
+            # the primary UNLESS it's the only candidate (single-kind nodes
+            # like the local extractor or the sink).
             continue
         # Effect escalation check (syntactic).
         node_effects = {e.kind for e in node.declared_effects}
