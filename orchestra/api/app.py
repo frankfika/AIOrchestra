@@ -78,6 +78,13 @@ def create_app(state: AppState | None = None) -> FastAPI:
         lifespan=lifespan,
     )
 
+    # M9 — structured logging + per-request id.
+    from orchestra.core.logging import RequestIdMiddleware, setup_logging
+    if not getattr(state, "_logging_configured", False):
+        setup_logging(level=os.environ.get("ORCHESTRA_LOG_LEVEL", "INFO"))
+        state._logging_configured = True
+    app.add_middleware(RequestIdMiddleware)
+
     # M3 UX-001/UX-002 — mount the HTML Demo Console. The router uses
     # a state_provider closure so it shares the same EventStore and
     # Coordinator as the JSON API.
