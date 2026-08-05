@@ -1,13 +1,22 @@
-"""P0 frozen vocabulary (Task / Capability / Plan / Event / Receipt).
+"""M0 frozen vocabulary (STIR / Capability Manifest / Plan / Event / Receipt).
 
-This module is the **single source of truth** for the P0 data model. Every
+This module is the **single source of truth** for the M0 data model. Every
 other component imports from here. If you want to add a field, first check
-``Orchestra_开发计划.md`` §0.1.2 — names and meanings are frozen at M0, and
-P0 implements a subset.
+``Orchestra_开发计划.md`` §0.1.2 — names and meanings are frozen at M0.
 
 Why Pydantic v2: structural validation, JSON-Schema export, and good
 ergonomics for the demo. The cost is one extra runtime dependency; the
-benefit is that ``model_dump()`` is canonical for hashing and signing.
+benefit is that ``model_dump(mode="json")`` is canonical for hashing,
+signing, and the JSON-Schema dump in :func:`export_json_schemas`.
+
+M0 extends P0 with:
+  - :class:`ValueRef` — typed handle to a value produced by a node
+  - :class:`Requirement` — node-level non-functional requirement
+  - :class:`InformationFlowRule` — formal label-propagation semantics
+  - :class:`FieldManifest` — deterministic field-level projection spec
+    used by :class:`XFR-001` (Schema Projection + Egress PEP, M3)
+  - :class:`Citation` / :class:`CitationManifest` — claim-to-source
+    mapping used by :class:`REL-001` (M5)
 """
 from __future__ import annotations
 
@@ -26,12 +35,11 @@ from orchestra.core.time import parse_utc_iso, utc_now_iso
 
 
 class DataClassification(str, Enum):
-    """Confidentiality tiers P0 understands.
+    """Confidentiality tiers M0 understands.
 
-    P0 uses a 4-tier scale that maps to the white paper's restricted /
-    internal / partner / public spectrum. **Restricted** data must never
-    reach a public Adapter — that is invariant #1 in the 26-invariants
-    matrix.
+    4-tier scale that maps to the white paper's restricted / internal /
+    partner / public spectrum. **Restricted** data must never reach a
+    public Adapter — that is invariant #1 in the 26-invariants matrix.
     """
 
     PUBLIC = "public"
@@ -515,3 +523,206 @@ class FallbackPolicy(BaseModel):
     from_node: str
     fallback_capability_id: str
     trigger: Literal["policy-deny", "capability-error", "timeout", "all"] = "all"
+
+
+# ---------------------------------------------------------------------------
+# M0 additions: ValueRef, Requirement, InformationFlowRule
+# ---------------------------------------------------------------------------
+
+
+class ValueRef(BaseModel):
+    """A typed reference to a value produced by an upstream node.
+
+    Used in :class:`PlanNode.input_views` and :class:`AdapterRequest.inputs`
+    to express the dataflow topology. The producer node's id is part of
+    the ref so a Trust Compiler can statically resolve the data lineage.
+
+    The reference does NOT carry the value itself — the value lives in
+    the Zone Artifact Store (M0 §0.2 Agent-3 deliverable) and is fetched
+    by the Adapter with the Node Grant as authorization.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    ref_id: str = Field(default_factory=new_id)
+    producer_node_id: str
+    producer_output: str = Field(description="logical output name of the producer")
+    view_name: Optional[str] = Field(default=None, description="resolved DataView name")
+    type_hint: Literal["text", "json", "binary", "reference", "stream"] = "json"
+    label: Optional[SecurityLabel] = Field(
+        default=None,
+        description="label of the data at the time of ValueRef resolution",
+    )
+
+
+class Requirement(BaseModel):
+    """Non-functional requirement a node declares about its execution
+    environment. The Trust Compiler checks these against the
+    Capability Manifest's ``runtime_requirements`` field at compile time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal[
+        "region",
+        "gpu",
+        "memory-mb",
+        "timeout-ms",
+        "network",
+        "tool",
+        "language",
+        "tier",
+    ]
+    op: Literal["eq", "ne", "lt", "le", "gt", "ge", "in"] = "eq"
+    value: Any
+
+
+class JoinSemantics(str, Enum):
+    """How a node combines the labels of its inputs to produce the
+    label of its outputs. The default for the M0 reference Contract
+    Review flow is :attr:`JOIN` (the most restrictive label wins).
+    """
+
+    JOIN = "join"            # output = join(input_labels);  restrictive
+    MEET = "meet"            # output = meet(input_labels); permissive
+    PASSTHROUGH = "passthrough"  # output = first non-empty input
+    EXPLICIT = "explicit"    # the node's manifest declares the output label
+
+
+class InformationFlowRule(BaseModel):
+    """Formal label-propagation rule attached to a node.
+
+    The Trust Compiler in M1 enforces these rules on every Plan. P0
+    ships a *declarative* form; the M0 deliverable (SPEC-001) freezes
+    the shape so M1 can implement the checker without breaking P0.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    rule_id: str
+    join: JoinSemantics = JoinSemantics.JOIN
+    # Optional explicit override (used when join=EXPLICIT).
+    explicit_output_label: Optional[SecurityLabel] = None
+    # Restrict to specific input refs (default: all inputs).
+    input_refs: list[str] = Field(default_factory=list)
+    # If set, the rule applies only to outputs of this name.
+    output_name: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# M0 addition: FieldManifest (Schema Projection input)
+# ---------------------------------------------------------------------------
+
+
+class FieldManifest(BaseModel):
+    """Deterministic field-level projection spec.
+
+    The M3 Egress PEP (XFR-001) reads this manifest to know exactly which
+    fields may leave the tenant. The Trust Compiler (M1) verifies that
+    the Egress PEP actually uses the manifest — not the plan — as the
+    source of truth for what crosses the boundary.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    manifest_id: str = Field(default_factory=lambda: f"fldman:{new_id()[:8]}")
+    name: str
+    version: str = "0.1.0"
+    source_view: str = Field(description="the DataView this manifest projects from")
+    allowed_fields: list[str] = Field(default_factory=list)
+    redaction_rules: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="list of {field, op: 'drop'|'hash'|'tokenize'|'partial-<n>'}",
+    )
+    byte_budget: Optional[int] = Field(
+        default=None,
+        description="max bytes the projected payload may consume (Pareto-style enforcement)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# M0 addition: Citation + CitationManifest (M5 input)
+# ---------------------------------------------------------------------------
+
+
+class CitationSourceRef(BaseModel):
+    """Pointer to a specific source (a Node output, an external public doc, etc)."""
+
+    model_config = ConfigDict(extra="forbid")
+    kind: Literal["node-output", "external-url", "external-doc", "synthetic"]
+    ref: str
+    version: Optional[str] = None
+    retrieved_at: Optional[str] = None
+    label: Optional[SecurityLabel] = None
+
+
+class Citation(BaseModel):
+    """A claim with a list of source references.
+
+    M5 REL-001 (Output/Citation Release Gate) verifies that every claim
+    in a published output has at least one allowed citation, and that
+    no citation leaks a higher-tier label than the claim's audience.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    citation_id: str = Field(default_factory=new_id)
+    claim: str
+    sources: list[CitationSourceRef]
+    audience: Literal["public", "partner", "internal", "restricted"] = "internal"
+    release_class: Literal["public", "partner", "attested", "restricted"] = "attested"
+
+
+class CitationManifest(BaseModel):
+    """Structured claim-to-source map for a Plan's outputs.
+
+    Produced by the Coordinator at the end of a run; consumed by the
+    Release Gate (M5) before any output leaves the tenant.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    manifest_id: str = Field(default_factory=lambda: f"citeman:{new_id()[:8]}")
+    task_run_id: str
+    citations: list[Citation]
+    total_claims: int = 0
+    unsourced_claims: int = 0
+
+
+# ---------------------------------------------------------------------------
+# M0 export helper
+# ---------------------------------------------------------------------------
+
+
+def export_json_schemas() -> dict[str, Any]:
+    """Dump the M0 JSON Schemas for every public type.
+
+    Used by:
+      - the schema-registry CI gate (M0 §0.2 Agent-1 deliverable)
+      - the Dify Task Tool to validate the on-the-wire payload
+      - the AgenticHub adapter (M4) to generate TypeScript bindings
+    """
+    types = [
+        SecurityLabel,
+        DataView,
+        Effect,
+        Purpose,
+        CapabilityManifest,
+        TaskContract,
+        TaskTemplate,
+        NodeSpec,
+        EdgeSpec,
+        PlanNode,
+        PlanEdge,
+        ExecutionPlan,
+        NodeGrant,
+        AuditEvent,
+        SignedReceipt,
+        RoutingDecision,
+        ApprovalSpec,
+        FallbackPolicy,
+        ValueRef,
+        Requirement,
+        InformationFlowRule,
+        FieldManifest,
+        Citation,
+        CitationManifest,
+    ]
+    out: dict[str, Any] = {}
+    for t in types:
+        out[t.__name__] = t.model_json_schema()
+    return out
