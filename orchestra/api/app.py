@@ -258,6 +258,114 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(400, str(e))
         return {"status": "approved", "task_run_id": task_run_id}
 
+    # ------------------------------------------------------------------
+    # M8 — Tenant + Publishing admin endpoints
+    # ------------------------------------------------------------------
+    # The CLI's ``orchestra tenant`` and ``orchestra publish`` commands
+    # talk to these. Each route is wrapped in the in-process Tenant
+    # context (admin role) so the multi-tenant IsolatingEventStore is
+    # exercised end-to-end through the same HTTP path the CLI uses.
+
+    @app.post("/admin/tenants")
+    def admin_create_tenant(body: dict) -> dict:
+        from orchestra.enterprise.tenant import (
+            Tenant, TenantContext, TenantRole, reset_active, set_active,
+        )
+        from orchestra.enterprise.isolation import IsolatingEventStore
+        tid = body.get("tenant_id")
+        if not tid or not isinstance(tid, str):
+            raise HTTPException(422, "tenant_id must be a non-empty string")
+        ctx = TenantContext(
+            tenant=Tenant(tenant_id="tenant:demo", name="demo"),
+            caller_id=body.get("caller_id", "cli"),
+            role=TenantRole.ADMIN,
+        )
+        token = set_active(ctx)
+        try:
+            store = IsolatingEventStore()
+            store.connect()
+            try:
+                store.create_tenant(tid, body.get("name", tid), plan=body.get("plan", "default"))
+                return {"tenant_id": tid, "status": "created"}
+            finally:
+                store.close()
+        finally:
+            reset_active(token)
+
+    @app.get("/admin/tenants")
+    def admin_list_tenants() -> dict:
+        from orchestra.enterprise.tenant import (
+            Tenant, TenantContext, TenantRole, reset_active, set_active,
+        )
+        from orchestra.enterprise.isolation import IsolatingEventStore
+        ctx = TenantContext(
+            tenant=Tenant(tenant_id="tenant:demo", name="demo"),
+            caller_id="cli",
+            role=TenantRole.ADMIN,
+        )
+        token = set_active(ctx)
+        try:
+            store = IsolatingEventStore()
+            store.connect()
+            try:
+                return {"tenants": store.list_tenants()}
+            finally:
+                store.close()
+        finally:
+            reset_active(token)
+
+    @app.post("/admin/publish")
+    def admin_publish(body: dict) -> dict:
+        """Publish an Agent Card. The body is a Card-shaped dict;
+        status is forced to PUBLISHED and the body is signed with
+        the dev key. The CLI's ``orchestra publish create`` calls
+        this."""
+        from pydantic import ValidationError
+        from orchestra.core.hashing import hmac_keygen
+        from orchestra.publishing.card import AgentCard, CardStatus, sign_card
+        # The dev key is a per-process generated key. Production
+        # swaps the signer for the M6 KMS — see ENT-003.
+        if not hasattr(state, "_publish_key"):
+            state._publish_key = hmac_keygen()
+        try:
+            card = AgentCard(**{**body, "status": CardStatus.DRAFT})
+        except ValidationError as e:
+            raise HTTPException(422, detail=e.errors())
+        from orchestra.publishing.registry import PublishedRegistry
+        registry = PublishedRegistry(default_key=state._publish_key, default_kid="key-cli-1")
+        # Carry over previously published cards so the registry
+        # isn't cleared on every CLI call (the app is a single
+        # process; this is the dev shape).
+        if hasattr(state, "_registry"):
+            registry._by_version = dict(state._registry._by_version)
+            registry._latest = dict(state._registry._latest)
+            registry._by_partner = {k: set(v) for k, v in state._registry._by_partner.items()}
+        signed = registry.publish(card, key=state._publish_key, kid="key-cli-1")
+        state._registry = registry
+        return signed.model_dump(mode="json")
+
+    @app.get("/admin/publish")
+    def admin_list_published() -> dict:
+        if not hasattr(state, "_registry"):
+            return {"cards": []}
+        out = []
+        for (cid, ver), entry in state._registry._by_version.items():
+            out.append({
+                "capability_id": cid,
+                "version": ver,
+                "status": entry.card.status.value,
+                "partner_id": entry.card.partner_id,
+            })
+        return {"cards": out}
+
+    @app.post("/admin/publish/{capability_id}/{version}/revoke")
+    def admin_revoke(capability_id: str, version: str, body: dict | None = None) -> dict:
+        if not hasattr(state, "_registry"):
+            raise HTTPException(404, "no published cards")
+        reason = (body or {}).get("reason", "")
+        state._registry.revoke(capability_id, version, reason=reason)
+        return {"capability_id": capability_id, "version": version, "status": "revoked"}
+
     return app
 
 

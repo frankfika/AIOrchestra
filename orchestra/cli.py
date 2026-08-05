@@ -120,6 +120,88 @@ def cmd_capabilities(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# M8 — Tenant admin subcommands
+# ---------------------------------------------------------------------------
+
+
+def cmd_tenant_list(args: argparse.Namespace) -> int:
+    base = args.base.rstrip("/")
+    r = httpx.get(f"{base}/admin/tenants", timeout=10.0)
+    if r.status_code != 200:
+        print(f"tenant list failed: {r.status_code} {r.text}", file=sys.stderr)
+        return 1
+    _print_json(r.json())
+    return 0
+
+
+def cmd_tenant_create(args: argparse.Namespace) -> int:
+    base = args.base.rstrip("/")
+    r = httpx.post(
+        f"{base}/admin/tenants",
+        json={"tenant_id": args.tenant_id, "name": args.name, "plan": args.plan},
+        timeout=10.0,
+    )
+    if r.status_code != 200:
+        print(f"tenant create failed: {r.status_code} {r.text}", file=sys.stderr)
+        return 1
+    print(f"created tenant: {args.tenant_id} (plan={args.plan})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# M8 — Publish admin subcommands
+# ---------------------------------------------------------------------------
+
+
+def cmd_publish_list(args: argparse.Namespace) -> int:
+    base = args.base.rstrip("/")
+    r = httpx.get(f"{base}/admin/publish", timeout=10.0)
+    if r.status_code != 200:
+        print(f"publish list failed: {r.status_code} {r.text}", file=sys.stderr)
+        return 1
+    _print_json(r.json())
+    return 0
+
+
+def cmd_publish_create(args: argparse.Namespace) -> int:
+    base = args.base.rstrip("/")
+    audiences = [a.strip() for a in args.audiences.split(",") if a.strip()]
+    data_views = [v.strip() for v in args.data_views.split(",") if v.strip()]
+    body = {
+        "capability_id": args.capability,
+        "name": args.name,
+        "version": args.version,
+        "partner_id": args.partner,
+        "partner_contract_id": args.contract,
+        "audiences": audiences,
+        "data_views": data_views,
+        "description": args.description,
+    }
+    r = httpx.post(f"{base}/admin/publish", json=body, timeout=10.0)
+    if r.status_code != 200:
+        print(f"publish create failed: {r.status_code} {r.text}", file=sys.stderr)
+        return 1
+    data = r.json()
+    print(f"published: {data.get('capability_id')} v{data.get('version')} (status={data.get('status')})")
+    print(f"card_id: {data.get('card_id')}")
+    return 0
+
+
+def cmd_publish_revoke(args: argparse.Namespace) -> int:
+    base = args.base.rstrip("/")
+    r = httpx.post(
+        f"{base}/admin/publish/{args.capability}/{args.version}/revoke",
+        json={"reason": args.reason},
+        timeout=10.0,
+    )
+    if r.status_code != 200:
+        print(f"publish revoke failed: {r.status_code} {r.text}", file=sys.stderr)
+        return 1
+    print(f"revoked: {args.capability} v{args.version}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestra", description="Orchestra CLI (M4 OSS-001)")
     p.add_argument("--base", default=_default_base(), help="Orchestra API base URL")
@@ -159,6 +241,38 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("capabilities", help="List registered capabilities")
     s.set_defaults(func=cmd_capabilities)
+
+    # --- M8: Tenant admin -------------------------------------------------
+    s = sub.add_parser("tenant", help="Tenant admin operations")
+    tenant_sub = s.add_subparsers(dest="tenant_command", required=True)
+    s2 = tenant_sub.add_parser("list", help="List all tenants")
+    s2.set_defaults(func=cmd_tenant_list)
+    s2 = tenant_sub.add_parser("create", help="Create a tenant")
+    s2.add_argument("tenant_id", help="tenant id (e.g. tenant:acme)")
+    s2.add_argument("--name", default=None, help="display name")
+    s2.add_argument("--plan", default="default", help="plan (default, pilot, enterprise)")
+    s2.set_defaults(func=cmd_tenant_create)
+
+    # --- M8: Publish admin -------------------------------------------------
+    s = sub.add_parser("publish", help="Published Capability admin operations")
+    pub_sub = s.add_subparsers(dest="publish_command", required=True)
+    s2 = pub_sub.add_parser("list", help="List all published cards")
+    s2.set_defaults(func=cmd_publish_list)
+    s2 = pub_sub.add_parser("create", help="Publish an Agent Card")
+    s2.add_argument("--capability", required=True, help="capability id (e.g. demo.summarize)")
+    s2.add_argument("--name", required=True, help="display name")
+    s2.add_argument("--version", default="0.1.0", help="card version (semver)")
+    s2.add_argument("--partner", required=True, help="partner id")
+    s2.add_argument("--contract", required=True, help="partner contract id")
+    s2.add_argument("--audiences", default="partner", help="comma-separated audience ids")
+    s2.add_argument("--data-views", default="", help="comma-separated data view names")
+    s2.add_argument("--description", default="", help="human-readable description")
+    s2.set_defaults(func=cmd_publish_create)
+    s2 = pub_sub.add_parser("revoke", help="Revoke a published card")
+    s2.add_argument("capability", help="capability id")
+    s2.add_argument("version", help="card version")
+    s2.add_argument("--reason", default="", help="revocation reason")
+    s2.set_defaults(func=cmd_publish_revoke)
 
     return p
 
