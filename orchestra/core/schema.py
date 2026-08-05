@@ -203,6 +203,14 @@ class CapabilityManifest(BaseModel):
     p50_latency_ms: int = Field(default=1000, ge=0)
     p95_latency_ms: int = Field(default=3000, ge=0)
     tags: dict[str, str] = Field(default_factory=dict)
+    # M3 XFR-001 — if set, the Coordinator will run the adapter inputs
+    # through the EgressPEP under this FieldManifest view before sending.
+    # Capabilities without a view never see the PEP (local tools, sinks,
+    # in-process nodes, etc.).
+    egress_view_name: Optional[str] = Field(
+        default=None,
+        description="FieldManifest view to project the egress through (M3 XFR-001)",
+    )
 
     def manifest_id(self) -> str:
         """Content-addressed ID for this manifest snapshot."""

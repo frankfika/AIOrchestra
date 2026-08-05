@@ -6,12 +6,15 @@ between an on-disk file and what tests expect.
 """
 from __future__ import annotations
 
+from typing import Callable, Optional
+
 from orchestra.core.schema import (
     CapabilityKind,
     CapabilityManifest,
     DataClassification,
     Effect,
     EffectKind,
+    FieldManifest,
     IntegrationLevel,
     SecurityLabel,
     SourceTrust,
@@ -89,6 +92,7 @@ def load_default_manifests(endpoints: dict[str, str] | None = None) -> ManifestS
             p50_latency_ms=1500,
             p95_latency_ms=3500,
             tags={"model": "demo-openai-compat", "max_tokens": "256"},
+            egress_view_name="public-research",
         ),
         CapabilityManifest(
             capability_id="a2a.reference-agent",
@@ -103,6 +107,7 @@ def load_default_manifests(endpoints: dict[str, str] | None = None) -> ManifestS
             p50_latency_ms=900,
             p95_latency_ms=2500,
             tags={"agent_card": "/.well-known/agent.json"},
+            egress_view_name="a2a-reference",
         ),
         CapabilityManifest(
             capability_id="sink.mock-procurement",
@@ -138,3 +143,67 @@ def load_default_manifests(endpoints: dict[str, str] | None = None) -> ManifestS
 
 def load_default_policy() -> PolicyEngine:
     return PolicyEngine(default_p0_rules())
+
+
+# ---------------------------------------------------------------------------
+# M3 XFR-001 — default FieldManifests
+# ---------------------------------------------------------------------------
+
+
+def load_default_field_manifests() -> dict[tuple[str, str], FieldManifest]:
+    """Return a lookup table of ``(capability_id, view_name) -> FieldManifest``.
+
+    The M3 Egress PEP calls this lookup at run time. A capability that
+    does not appear here cannot be reached — the PEP raises
+    :class:`EgressDenied`, which the Coordinator surfaces as
+    "no manifest published for this egress view".
+
+    The :class:`FieldManifest` operates on the **top-level input keys**
+    the Coordinator hands to the Adapter. For ``public.openai-compat``
+    the Adapter expects ``{"facts": {...}, "query": "..."}`` — the
+    manifest declares these as the only allowed top-level fields. The
+    inner ``facts`` dict is already a deterministic, restricted
+    extraction produced by the local extractor, so the manifest does
+    not need to re-redact its contents.
+    """
+    public_research_view = FieldManifest(
+        name="public-research",
+        source_view="view:public-research",
+        allowed_fields=["facts", "query"],
+        byte_budget=8 * 1024,
+    )
+    public_research_raw = FieldManifest(
+        name="public-research-raw",
+        source_view="view:public-research",
+        allowed_fields=["topic", "jurisdiction"],
+        byte_budget=128,
+    )
+    a2a_reference_view = FieldManifest(
+        name="a2a-reference",
+        source_view="view:a2a-reference",
+        allowed_fields=["facts", "query"],
+        byte_budget=8 * 1024,
+    )
+    return {
+        ("public.openai-compat", "public-research"): public_research_view,
+        ("public.openai-compat", "public-research-raw"): public_research_raw,
+        ("a2a.reference-agent", "a2a-reference"): a2a_reference_view,
+    }
+
+
+def make_egress_manifest_lookup(
+    overrides: Optional[dict[tuple[str, str], FieldManifest]] = None,
+) -> Callable[[str, str], Optional[FieldManifest]]:
+    """Build a ``(capability_id, view_name) -> FieldManifest`` lookup.
+
+    The base table is :func:`load_default_field_manifests`; ``overrides``
+    are layered on top and are intended for tests.
+    """
+    base = load_default_field_manifests()
+    if overrides:
+        base.update(overrides)
+
+    def _lookup(capability_id: str, view_name: str) -> Optional[FieldManifest]:
+        return base.get((capability_id, view_name))
+
+    return _lookup
