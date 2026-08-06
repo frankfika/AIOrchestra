@@ -61,6 +61,10 @@ class AppState:
     # in-process dispatcher; production swaps for a queue-backed
     # worker that survives process restarts.
     webhook_dispatcher: Any = None  # WebhookDispatcher | None
+    # M18 — per-task delivery history. The dev path is an
+    # in-memory ring buffer; production swaps for a durable
+    # store.
+    webhook_history: Any = None  # DeliveryHistory | None
 
 
 def _default_data_label() -> SecurityLabel:
@@ -114,10 +118,11 @@ async def _wrap_with_webhook(coro, *, task_run_id: str, state_provider):
         # skips the dispatch. The partner can still poll.
         return result
     from orchestra.core.ids import new_id
+    from orchestra.webhooks import WebhookDeliveryRecord
 
     delivery_id = new_id()
     try:
-        dispatcher.deliver(
+        delivery = dispatcher.deliver(
             config,
             task_run_id=task_run_id,
             state=result.state.value,
@@ -131,7 +136,21 @@ async def _wrap_with_webhook(coro, *, task_run_id: str, state_provider):
         # in-process task driver. The partner's webhook
         # endpoint is their problem; the task itself
         # succeeded.
-        pass
+        return result
+    # M18 — record the delivery in the in-memory history
+    # so a partner who queries ``GET /admin/webhooks/{id}``
+    # sees the outcome. A production swap persists to
+    # Postgres / DynamoDB.
+    history = getattr(state, "_webhook_history", None)
+    if history is not None:
+        history.record(
+            WebhookDeliveryRecord.from_delivery(
+                delivery,
+                task_run_id=task_run_id,
+                state=result.state.value,
+                delivery_id=delivery_id,
+            )
+        )
     return result
 
 
@@ -482,6 +501,81 @@ def create_app(state: AppState | None = None) -> FastAPI:
         response_model=TaskStatusResponse,
         summary="Submit a task",
         tags=["Tasks"],
+        responses={
+            200: {
+                "description": "Task created. The Coordinator is driving it in the background.",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "task_run_id": "eafa3a59-c4be-41b0-b8e8-a8a262209874",
+                            "state": "created",
+                            "plan_id": None,
+                            "node_results": {},
+                            "error": None,
+                        }
+                    }
+                },
+            },
+            422: {
+                "description": "Validation error (RFC 7807 problem body).",
+                "content": {
+                    "application/problem+json": {
+                        "example": {
+                            "type": "urn:orchestra:problem:validation_error",
+                            "title": "Request body or query failed validation.",
+                            "status": 422,
+                            "detail": "Field required",
+                            "instance": "req-1f2e3d4c5b6a",
+                            "orchestra": {
+                                "request_id": "req-1f2e3d4c5b6a",
+                                "errors": [
+                                    {
+                                        "loc": ["body", "contract_text"],
+                                        "msg": "Field required",
+                                        "type": "missing",
+                                    }
+                                ],
+                            },
+                        }
+                    }
+                },
+            },
+            429: {
+                "description": "Rate-limited (per-tenant token bucket).",
+                "content": {
+                    "application/problem+json": {
+                        "example": {
+                            "type": "urn:orchestra:problem:rate_limited",
+                            "title": "Token bucket exhausted; retry after the Retry-After interval.",
+                            "status": 429,
+                            "detail": "Token bucket exhausted; retry after the Retry-After interval.",
+                            "instance": "req-7c8b9a0d1e2f",
+                            "orchestra": {
+                                "request_id": "req-7c8b9a0d1e2f",
+                                "tenant": "partner-smoke",
+                                "retry_after_seconds": 1,
+                            },
+                        }
+                    }
+                },
+            },
+        },
+        openapi_extra={
+            "requestBody": {
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "contract_id": "ctr-2024-001",
+                            "contract_text": "MASTER SERVICES AGREEMENT\n\nThis Agreement...",
+                            "vendor_id": "vendor-42",
+                            "budget_usd": 1.0,
+                            "webhook_url": "https://partner.example.com/orchestra/callback",
+                            "webhook_secret": "shared-secret-from-partner-portal",
+                        }
+                    }
+                }
+            }
+        },
     )
     async def submit_task(req: SubmitTaskRequest) -> TaskStatusResponse:
         task_run_id = new_id()
@@ -872,6 +966,65 @@ def create_app(state: AppState | None = None) -> FastAPI:
         state._registry.revoke(capability_id, version, reason=reason)
         return {"capability_id": capability_id, "version": version, "status": "revoked"}
 
+    @app.get(
+        "/admin/webhooks/{task_run_id}",
+        summary="List webhook delivery history for a task",
+        tags=["Admin"],
+        responses={
+            200: {
+                "description": "Delivery history for the task. The dev path keeps the last 16 records per task; production persists.",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "task_run_id": "eafa3a59-c4be-41b0-b8e8-a8a262209874",
+                            "count": 1,
+                            "deliveries": [
+                                {
+                                    "delivery_id": "8c3a2b91-3d4e-4f2a-9b1c-2e5d6f7a8b9c",
+                                    "task_run_id": "eafa3a59-c4be-41b0-b8e8-a8a262209874",
+                                    "state": "succeeded",
+                                    "delivered": True,
+                                    "attempts": 1,
+                                    "last_status": 200,
+                                    "error": "",
+                                    "attempt_started_at": "2026-08-06T01:19:31.046+00:00",
+                                }
+                            ],
+                        }
+                    }
+                },
+            },
+            404: {
+                "description": "No delivery records for this task (no webhook was registered, or the task id is wrong).",
+                "content": {
+                    "application/problem+json": {
+                        "example": {
+                            "type": "urn:orchestra:problem:not_found",
+                            "title": "Resource not found.",
+                            "status": 404,
+                            "detail": "no webhook history for task no-such-task",
+                            "instance": "req-9b8c7d6e5f4a",
+                        }
+                    }
+                },
+            },
+        },
+    )
+    def admin_webhook_history(task_run_id: str) -> dict:
+        """Return the in-memory delivery history for a
+        task. A partner whose webhook never fires queries
+        this to see whether the dispatcher reached the
+        partner, what status the partner returned, and
+        what the last error was. The dev path keeps the
+        last 16 records per task; production persists."""
+        history = getattr(state, "webhook_history", None)
+        records = history.for_task(task_run_id) if history is not None else []
+        return {
+            "task_run_id": task_run_id,
+            "count": len(records),
+            "deliveries": [r.to_dict() for r in records],
+        }
+
     return app
 
 
@@ -888,7 +1041,7 @@ def _bootstrap_default_state() -> AppState:
     from orchestra.coordinator.engine import build_default_coordinator
     from orchestra.observability import Metrics, builtin_metrics
     from orchestra.runtime.rate_limit import RateLimiter, TokenBucket
-    from orchestra.webhooks import WebhookDispatcher
+    from orchestra.webhooks import DeliveryHistory, WebhookDispatcher
 
     endpoints_obj = start_all_servers()
     endpoints = {k: v["endpoint"] for k, v in endpoints_obj.items()}
@@ -923,6 +1076,7 @@ def _bootstrap_default_state() -> AppState:
         rate_limiter=limiter,
         max_request_bytes=max_body,
         webhook_dispatcher=WebhookDispatcher(),
+        webhook_history=DeliveryHistory(),
     )
 
 

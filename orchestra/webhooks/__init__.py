@@ -10,11 +10,14 @@ from orchestra.webhooks.dispatcher import (
     build_payload,
     sign_body,
 )
+from orchestra.webhooks.history import DeliveryHistory, WebhookDeliveryRecord
 
 __all__ = [
     "WebhookDispatcher",
     "WebhookConfig",
     "WebhookDelivery",
+    "DeliveryHistory",
+    "WebhookDeliveryRecord",
     "build_payload",
     "sign_body",
     "SIGNATURE_HEADER",
