@@ -7,9 +7,9 @@ on every change. Higher-priority rules (orchestra/白皮书, /开发计划)
 win on conflict; this file is the bridge between those documents
 and the agent's daily decisions.
 
-> **Status: M0–M19 shipped.** The original P0 matrix in §2 is
+> **Status: M0–M20 shipped.** The original P0 matrix in §2 is
 > preserved for traceability; the actual production surface is
-> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11 + M12 + M13 + M14 + M15 + M16 + M17 + M18 + M19.
+> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11 + M12 + M13 + M14 + M15 + M16 + M17 + M18 + M19 + M20.
 > The "P0 not-in-scope" column is the **historical** P0 boundary;
 > the dev plan moved those items to M1+ in later milestones.
 
@@ -53,7 +53,8 @@ may not silently resolve them.
 | **M17** | `56a909e` | Webhook callback: partner supplies ``webhook_url`` + ``webhook_secret`` at submit time; dev path POSTs a signed (HMAC-SHA-256) JSON payload on terminal state. ``X-Orchestra-Signature`` + ``X-Orchestra-Delivery-Id`` + ``X-Orchestra-Event-Type`` headers + 3-attempt exponential backoff. Live smoke: partner verified HMAC, got 200 OK on first try. | `orchestra.webhooks`, `orchestra.api.app` |
 | **M18** | `1be746e` | Webhook delivery history + OpenAPI request/response examples. Partner whose webhook never fires queries ``GET /admin/webhooks/{task_id}`` to see attempts + last error. ``POST /tasks`` ships a copy-pasteable requestBody example + 200/422/429 response examples in ``/docs`` so a partner SDK generator has a real shape. | `orchestra.webhooks.history`, `orchestra.api.app` |
 | **M19** | `4f59baf` | Webhook manual retry: ``POST /admin/webhooks/{task_id}/retry`` re-fires the latest failed delivery using the stored URL + secret. A SRE notices a flaky partner is back online, hits one endpoint, partner's dedup logic sees a fresh ``delivery_id``. Original record stays in history; new record is appended alongside. | `orchestra.webhooks.history`, `orchestra.api.app` |
-| **M20** | (in flight) | SSE streaming task events: ``GET /tasks/{task_run_id}/events/stream`` returns a live Server-Sent Events feed of the audit timeline. Late subscribers see the per-task history first, then live events, then ``event: done`` on terminal state. SDK gets ``stream_events(task_id)`` iterable. Push + webhook + poll, three ways to consume the same timeline. | `orchestra.streaming`, `orchestra.coordinator.engine`, `orchestra_sdk` |
+| **M20** | `14a1f40` | SSE streaming task events: ``GET /tasks/{task_run_id}/events/stream`` returns a live Server-Sent Events feed of the audit timeline. Late subscribers see the per-task history first, then live events, then ``event: done`` on terminal state. SDK gets ``stream_events(task_id)`` iterable. Push + webhook + poll, three ways to consume the same timeline. | `orchestra.streaming`, `orchestra.coordinator.engine`, `orchestra_sdk` |
+| **M21** | (in flight) | ADR rollout: 8 new ADRs (0004–0011) capture the M1–M20 design rationale (Trust Compiler in-process, Egress PEP field projection, HMAC bearer tokens, tenant isolation at storage layer, token-bucket rate limit, RFC 7807 errors, HMAC-signed webhooks, in-process SSE bus) + ``ADR/README.md`` index. A partner integrator reads 0005+0006+0009+0010; a SRE reads 0007+0008+0011. | `ADR/` |
 
 248 tests pass; 19 intentionally skipped (clean-room install +
 M1+ invariants that need M1+ features). M13 adds 32 tests
@@ -153,6 +154,7 @@ implements the subset actually used.
 | Webhook dispatcher (HMAC-signed) | `orchestra/webhooks/` |
 | Webhook delivery history | `orchestra/webhooks/history.py` |
 | Live event bus (SSE) | `orchestra/streaming/event_bus.py` |
+| Architecture decision records | `ADR/` |
 | CLI | `orchestra/cli.py` |
 | Demo Console (HTML) | `orchestra/ux/` |
 | Helm chart | `deploy/helm/` |
