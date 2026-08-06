@@ -1,0 +1,4 @@
+# PEP 561 marker — tells mypy / pyright that the orchestra_sdk
+# package ships inline type annotations. Partners who type-check
+# their integration don't need a separate types-orchestra-sdk
+# package.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,6 +12,7 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from orchestra.benchmarks.runner import BenchmarkResult, BenchmarkRunner
 from orchestra.coordinator.engine import Coordinator
@@ -178,6 +180,99 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     ux_router = build_ux_router(state_provider=lambda: state)
     app.include_router(ux_router)
+
+    # M16 — standard error envelope (RFC 7807 Problem Details). Every
+    # 4xx and 5xx response carries the same shape; partners parse it
+    # once and turn each error into a typed exception. The handlers
+    # run on the M9 request-id contextvar so the ``instance`` field
+    # points at a real log line.
+    from fastapi.exceptions import RequestValidationError
+    from orchestra.api.errors import (
+        PROBLEM_JSON,
+        problem_from_http_exception,
+    )
+    from orchestra.core.logging import current_request_id
+
+    @app.exception_handler(HTTPException)
+    async def _http_exception_handler(request, exc: HTTPException):  # noqa: ARG001
+        problem = problem_from_http_exception(
+            exc,
+            status=exc.status_code,
+            request_id=current_request_id() or "",
+        )
+        return Response(
+            content=json.dumps(problem.to_dict()),
+            status_code=exc.status_code,
+            media_type=PROBLEM_JSON,
+            headers=getattr(exc, "headers", None) or {},
+        )
+
+    @app.exception_handler(StarletteHTTPException)
+    async def _starlette_http_exception_handler(request, exc: StarletteHTTPException):  # noqa: ARG001
+        # Starlette raises its own HTTPException for 404 (no
+        # matching route) and 405 (wrong method on a known
+        # route). Funnel both through the same ProblemDetail
+        # shape so a partner's error parser sees one format.
+        problem = problem_from_http_exception(
+            exc,
+            status=exc.status_code,
+            request_id=current_request_id() or "",
+        )
+        return Response(
+            content=json.dumps(problem.to_dict()),
+            status_code=exc.status_code,
+            media_type=PROBLEM_JSON,
+            headers=getattr(exc, "headers", None) or {},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _validation_exception_handler(request, exc: RequestValidationError):  # noqa: ARG001
+        # Pydantic validation errors carry a list of {loc, msg, type}
+        # dicts; we surface the first one's message in the detail and
+        # include the full list in the ``orchestra`` extension.
+        from orchestra.api.errors import PROBLEM_TYPES, problem_type_uri
+
+        errors = exc.errors() if hasattr(exc, "errors") else []
+        first_msg = errors[0].get("msg", "validation failed") if errors else "validation failed"
+        problem_dict = {
+            "type": problem_type_uri("validation_error"),
+            "title": PROBLEM_TYPES["validation_error"],
+            "status": 422,
+            "detail": first_msg,
+            "instance": current_request_id() or "",
+            "orchestra": {
+                "request_id": current_request_id() or "",
+                "errors": errors,
+            },
+        }
+        return Response(
+            content=json.dumps(problem_dict),
+            status_code=422,
+            media_type=PROBLEM_JSON,
+        )
+
+    @app.exception_handler(Exception)
+    async def _unhandled_exception_handler(request, exc: Exception):  # noqa: ARG001
+        # 500 must never leak the raw traceback; the request id is
+        # what an operator greps for in the logs.
+        from orchestra.api.errors import PROBLEM_TYPES, problem_type_uri
+
+        problem_dict = {
+            "type": problem_type_uri("internal_error"),
+            "title": PROBLEM_TYPES["internal_error"],
+            "status": 500,
+            "detail": "Unhandled server-side failure; see logs.",
+            "instance": current_request_id() or "",
+            "orchestra": {
+                "request_id": current_request_id() or "",
+                "error_type": type(exc).__name__,
+            },
+        }
+        return Response(
+            content=json.dumps(problem_dict),
+            status_code=500,
+            media_type=PROBLEM_JSON,
+        )
 
     @app.get(
         "/healthz",
