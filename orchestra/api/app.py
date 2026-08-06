@@ -140,7 +140,10 @@ async def _wrap_with_webhook(coro, *, task_run_id: str, state_provider):
     # M18 — record the delivery in the in-memory history
     # so a partner who queries ``GET /admin/webhooks/{id}``
     # sees the outcome. A production swap persists to
-    # Postgres / DynamoDB.
+    # Postgres / DynamoDB. M19 — the record also stores
+    # the partner's URL + secret so a manual retry can
+    # re-fire the original payload without the operator
+    # having to re-supply the config.
     history = getattr(state, "_webhook_history", None)
     if history is not None:
         history.record(
@@ -149,6 +152,11 @@ async def _wrap_with_webhook(coro, *, task_run_id: str, state_provider):
                 task_run_id=task_run_id,
                 state=result.state.value,
                 delivery_id=delivery_id,
+                webhook_url=config.url,
+                webhook_secret=config.secret,
+                plan_id=result.plan.plan_id if result.plan else None,
+                node_results=result.node_results,
+                payload_error=result.error,
             )
         )
     return result
@@ -1023,6 +1031,109 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "task_run_id": task_run_id,
             "count": len(records),
             "deliveries": [r.to_dict() for r in records],
+        }
+
+    @app.post(
+        "/admin/webhooks/{task_run_id}/retry",
+        summary="Manually retry the latest failed webhook delivery",
+        tags=["Admin"],
+        responses={
+            200: {
+                "description": "Retry accepted. The new delivery uses a fresh delivery_id; the original record stays in the history so a SRE can compare outcomes.",
+                "content": {
+                    "application/json": {
+                        "example": {
+                            "task_run_id": "eafa3a59-c4be-41b0-b8e8-a8a262209874",
+                            "retried": True,
+                            "new_delivery_id": "f7a8b9c0-1d2e-3f4a-5b6c-7d8e9f0a1b2c",
+                            "delivered": True,
+                            "attempts": 1,
+                            "last_status": 200,
+                            "error": "",
+                        }
+                    }
+                },
+            },
+            404: {
+                "description": "No failed delivery to retry (the task has no history, or every prior delivery already succeeded).",
+                "content": {
+                    "application/problem+json": {
+                        "example": {
+                            "type": "urn:orchestra:problem:not_found",
+                            "title": "Resource not found.",
+                            "status": 404,
+                            "detail": "no failed webhook delivery for task eafa3a59-c4be-41b0-b8e8-a8a262209874",
+                            "instance": "req-1a2b3c4d5e6f",
+                        }
+                    }
+                },
+            },
+        },
+    )
+    def admin_webhook_retry(task_run_id: str) -> dict:
+        """Re-fire the most recent failed delivery.
+
+        A SRE who notices a partner's endpoint is back
+        online uses this to re-deliver the latest
+        failed payload without re-submitting the task.
+        The retry uses the original partner URL + secret
+        (stored on the record) and a fresh ``delivery_id``
+        so a partner's dedup logic sees it as a new
+        attempt. The original record stays in the
+        history; the new record is appended alongside it.
+        """
+        history = getattr(state, "webhook_history", None)
+        if history is None:
+            raise HTTPException(503, "webhook history is not initialised")
+        last = history.last_failed(task_run_id)
+        if last is None:
+            raise HTTPException(
+                404,
+                f"no failed webhook delivery for task {task_run_id}",
+            )
+        dispatcher = getattr(state, "webhook_dispatcher", None)
+        if dispatcher is None:
+            raise HTTPException(503, "webhook dispatcher is not initialised")
+        from orchestra.core.ids import new_id
+        from orchestra.webhooks import WebhookConfig, WebhookDeliveryRecord
+
+        # Re-fire the original payload with a fresh
+        # delivery_id. The partner dedupes on the id; a
+        # new id means a new logical attempt.
+        new_delivery_id = new_id()
+        delivery = dispatcher.deliver(
+            WebhookConfig(url=last.webhook_url, secret=last.webhook_secret),
+            task_run_id=last.task_run_id,
+            state=last.state,
+            plan_id=last.plan_id,
+            node_results=last.node_results or {},
+            error=last.payload_error,
+            delivery_id=new_delivery_id,
+        )
+        # Append the new attempt to the history so the
+        # ``GET /admin/webhooks/{id}`` view reflects
+        # the retry.
+        history.record(
+            WebhookDeliveryRecord.from_delivery(
+                delivery,
+                task_run_id=last.task_run_id,
+                state=last.state,
+                delivery_id=new_delivery_id,
+                webhook_url=last.webhook_url,
+                webhook_secret=last.webhook_secret,
+                plan_id=last.plan_id,
+                node_results=last.node_results,
+                payload_error=last.payload_error,
+            )
+        )
+        return {
+            "task_run_id": last.task_run_id,
+            "retried": True,
+            "new_delivery_id": new_delivery_id,
+            "delivered": delivery.delivered,
+            "attempts": delivery.attempts,
+            "last_status": delivery.last_status,
+            "error": delivery.error,
         }
 
     return app

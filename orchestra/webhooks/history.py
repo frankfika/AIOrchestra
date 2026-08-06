@@ -35,7 +35,12 @@ class WebhookDeliveryRecord:
     The record is what the partner sees in
     ``GET /admin/webhooks/{task_id}`` so they can
     diagnose a misconfigured endpoint without reading
-    server logs.
+    server logs. The record also carries the partner's
+    ``webhook_url`` + ``webhook_secret`` + the
+    ``plan_id`` + ``node_results`` + ``error`` from
+    the original payload, so an operator who fixes the
+    partner endpoint can re-fire the original delivery
+    via :meth:`DeliveryHistory.retry_last`.
     """
 
     delivery_id: str
@@ -46,6 +51,15 @@ class WebhookDeliveryRecord:
     last_status: int
     error: str = ""
     attempt_started_at: str = ""
+    # M19 — the partner URL + secret + the original
+    # payload fields. Stored on the record so a manual
+    # retry reuses the partner's original config without
+    # requiring the operator to re-supply it.
+    webhook_url: str = ""
+    webhook_secret: str = ""
+    plan_id: str | None = None
+    node_results: dict[str, Any] | None = None
+    payload_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +81,11 @@ class WebhookDeliveryRecord:
         task_run_id: str,
         state: str,
         delivery_id: str,
+        webhook_url: str = "",
+        webhook_secret: str = "",
+        plan_id: str | None = None,
+        node_results: dict[str, Any] | None = None,
+        payload_error: str | None = None,
     ) -> "WebhookDeliveryRecord":
         return cls(
             delivery_id=delivery_id,
@@ -77,6 +96,11 @@ class WebhookDeliveryRecord:
             last_status=int(getattr(delivery, "last_status", 0)),
             error=str(getattr(delivery, "error", "")),
             attempt_started_at=datetime.now(timezone.utc).isoformat(),
+            webhook_url=webhook_url,
+            webhook_secret=webhook_secret,
+            plan_id=plan_id,
+            node_results=node_results or {},
+            payload_error=payload_error,
         )
 
 
@@ -115,6 +139,25 @@ class DeliveryHistory:
             if buf is None:
                 return []
             return list(buf)
+
+    def last_failed(self, task_run_id: str) -> WebhookDeliveryRecord | None:
+        """Return the most recent failed (i.e. not
+        delivered) record for a task, or ``None`` if the
+        task has no failed deliveries.
+
+        M19 — a manual retry endpoint uses this to find
+        the record to re-fire. The contract is "the
+        latest failure" because operators usually want
+        to retry the most recent payload (which carries
+        the most up-to-date state)."""
+        with self._lock:
+            buf = self._by_task.get(task_run_id)
+            if buf is None:
+                return None
+            for record in reversed(buf):
+                if not record.delivered:
+                    return record
+            return None
 
     def all_keys(self) -> list[str]:
         """The list of task ids with at least one record."""
