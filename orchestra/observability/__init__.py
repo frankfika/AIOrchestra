@@ -17,6 +17,9 @@ Exports:
   * :class:`HTTPMetricsMiddleware` — ASGI middleware that records
     ``orchestra_http_requests_total`` and
     ``orchestra_http_request_duration_seconds``.
+  * M14 :class:`RateLimitMiddleware` and
+    :class:`RequestSizeLimitMiddleware` — DoS hardening ASGI
+    middleware that pair with the rate-limit metrics.
 """
 
 from orchestra.observability.http import HTTPMetricsMiddleware
@@ -28,6 +31,10 @@ from orchestra.observability.metrics import (
     builtin_metrics,
     render_prometheus,
 )
+from orchestra.observability.rate_limit_mw import (
+    RateLimitMiddleware,
+    RequestSizeLimitMiddleware,
+)
 
 __all__ = [
     "Counter",
@@ -37,4 +44,6 @@ __all__ = [
     "builtin_metrics",
     "render_prometheus",
     "HTTPMetricsMiddleware",
+    "RateLimitMiddleware",
+    "RequestSizeLimitMiddleware",
 ]

@@ -41,6 +41,14 @@ class AppState:
     # ticks the per-request counters. Production swaps the registry
     # for prometheus_client / OTel without changing the wire format.
     metrics: Metrics = field(default_factory=builtin_metrics)
+    # M14 — per-tenant rate limiter. Configured from the env at
+    # bootstrap; the dev path defaults to a permissive bucket so
+    # local testing isn't throttled, while ``ORCHESTRA_RATE_LIMIT_RPS``
+    # lets a SRE dial it for pilot traffic.
+    rate_limiter: Any = None  # RateLimiter | None
+    # M14 — request size cap. Requests larger than this are
+    # rejected with 413 before the body reaches the application.
+    max_request_bytes: int = 1 * 1024 * 1024  # 1 MiB
 
 
 def _default_data_label() -> SecurityLabel:
@@ -113,6 +121,23 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # orchestra_http_requests_total and the request-duration histogram
     # for every HTTP exchange (including /metrics itself).
     app.add_middleware(HTTPMetricsMiddleware, metrics=state.metrics)
+    # M14 — per-tenant rate limit + request size cap. Both run AFTER
+    # the metrics middleware so a 429 / 413 still ticks the
+    # request counter and the duration histogram. A SRE can
+    # therefore graph throttle pressure on the same dashboard as
+    # throughput.
+    from orchestra.observability import (
+        RateLimitMiddleware,
+        RequestSizeLimitMiddleware,
+    )
+
+    if state.rate_limiter is not None:
+        app.add_middleware(RateLimitMiddleware, limiter=state.rate_limiter)
+    app.add_middleware(
+        RequestSizeLimitMiddleware,
+        max_bytes=state.max_request_bytes,
+        metrics=state.metrics,
+    )
 
     # M3 UX-001/UX-002 — mount the HTML Demo Console. The router uses
     # a state_provider closure so it shares the same EventStore and
@@ -549,6 +574,8 @@ def _bootstrap_default_state() -> AppState:
     from orchestra.adapters.servers import start_all_servers
     from orchestra.benchmarks.runner import BenchmarkRunner
     from orchestra.coordinator.engine import build_default_coordinator
+    from orchestra.observability import Metrics, builtin_metrics
+    from orchestra.runtime.rate_limit import RateLimiter, TokenBucket
 
     endpoints_obj = start_all_servers()
     endpoints = {k: v["endpoint"] for k, v in endpoints_obj.items()}
@@ -559,7 +586,26 @@ def _bootstrap_default_state() -> AppState:
         store=store,
         coordinator_factory=lambda: build_default_coordinator(store=store, endpoints=endpoints),
     )
-    return AppState(store=store, coordinator=coordinator, benchmark_runner=runner)
+    # M14 — wire a per-tenant token-bucket rate limiter. The dev
+    # default is permissive (1000 RPS, 1000 burst) so local testing
+    # isn't throttled; a SRE dialing pilot traffic down sets
+    # ``ORCHESTRA_RATE_LIMIT_RPS`` and ``ORCHESTRA_RATE_LIMIT_BURST``.
+    metrics = builtin_metrics()
+    rps = float(os.environ.get("ORCHESTRA_RATE_LIMIT_RPS", "1000"))
+    burst = float(os.environ.get("ORCHESTRA_RATE_LIMIT_BURST", "1000"))
+    limiter = RateLimiter(
+        bucket_factory=lambda _key: TokenBucket(capacity=burst, refill_rate=rps),
+        metrics=metrics,
+    )
+    max_body = int(os.environ.get("ORCHESTRA_MAX_REQUEST_BYTES", str(1 * 1024 * 1024)))
+    return AppState(
+        store=store,
+        coordinator=coordinator,
+        benchmark_runner=runner,
+        metrics=metrics,
+        rate_limiter=limiter,
+        max_request_bytes=max_body,
+    )
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8000) -> None:
