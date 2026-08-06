@@ -283,6 +283,21 @@ class OrchestraClient:
         data = self._get(f"/api/v1/orchestra/tasks/{task_run_id}/events")
         return [TaskEvent.from_dict(e) for e in data.get("events", [])]
 
+    def stream_events(self, task_run_id: str) -> "EventStream":
+        """Stream live audit events for a task via Server-Sent Events.
+
+        Returns an :class:`EventStream` iterable that yields
+        :class:`TaskEvent` objects as they happen. The stream
+        closes when the task reaches a terminal state.
+
+        Usage:
+
+            with client.stream_events(task_id) as events:
+                for ev in events:
+                    print(ev.kind, ev.payload)
+        """
+        return EventStream(self, task_run_id)
+
     def get_receipts(self, task_run_id: str) -> list[TaskReceipt]:
         """List the signed receipts for a task (with verification status)."""
         data = self._get(f"/api/v1/orchestra/tasks/{task_run_id}/receipts")
@@ -376,6 +391,75 @@ class OrchestraClient:
         url = f"{self._base_url}{path}"
         r = self._http.post(url, headers=self._headers(), json=json)
         return _parse(r)
+
+
+class EventStream:
+    """A live iterator over a task's audit timeline.
+
+    The stream opens an SSE connection to
+    ``GET /tasks/{id}/events/stream`` and yields events
+    as they happen. The connection closes when the
+    server emits the ``event: done`` line (terminal
+    state reached) or the partner closes the iterator.
+
+    The class supports the context-manager protocol so a
+    partner can ``with`` it and guarantee the underlying
+    HTTP response is closed.
+    """
+
+    def __init__(self, client: "OrchestraClient", task_run_id: str) -> None:
+        self._client = client
+        self._task_run_id = task_run_id
+        self._response: httpx.Response | None = None
+
+    def __enter__(self) -> "EventStream":
+        url = f"{self._client._base_url}/api/v1/orchestra/tasks/{self._task_run_id}/events/stream"
+        # ``stream=True`` so the SDK doesn't buffer the
+        # entire SSE response; ``timeout=None`` so the
+        # connection can stay open for the full task
+        # lifetime without httpx giving up.
+        self._response = self._client._http.stream(
+            "GET", url, headers=self._client._headers(), timeout=None
+        )
+        self._response.__enter__()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        if self._response is not None:
+            self._response.__exit__(*exc)
+
+    def __iter__(self) -> "EventStream":
+        return self
+
+    def __next__(self) -> TaskEvent:
+        """Yield the next event from the stream.
+
+        The server's SSE format is one or more
+        ``data: <json>`` lines, blank line terminator.
+        A line starting with ``event: done`` is the
+        close signal; we stop iterating.
+        """
+        assert self._response is not None, "stream not entered"
+        for line in self._response.iter_lines():
+            if not line:
+                continue
+            if line.startswith("event: done"):
+                raise StopIteration
+            if line.startswith("data: "):
+                payload = line[len("data: ") :]
+                import json
+
+                try:
+                    d = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+                return TaskEvent(
+                    event_id="",
+                    task_run_id=d.get("task_run_id", self._task_run_id),
+                    kind=d.get("kind", ""),
+                    payload=d.get("payload", {}),
+                )
+        raise StopIteration
 
 
 def _parse(response: httpx.Response) -> dict[str, Any]:

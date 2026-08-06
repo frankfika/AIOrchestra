@@ -24,6 +24,7 @@ payload (only the FieldManifest's allowed_fields, after redactions) and
 the audit timeline records an ``io.sent`` event with the projected
 digest — never the raw payload.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -89,6 +90,7 @@ class Coordinator:
         receipt_builder: ReceiptBuilder,
         approval_handler: ApprovalHandler | None = None,
         egress_pep: EgressPEP | None = None,
+        event_bus: Any = None,
     ) -> None:
         self._store = store
         self._router = router
@@ -103,7 +105,12 @@ class Coordinator:
         # in-process "ingest_contract" node can re-derive the contract
         # text without re-reading the request.
         self._initial_inputs: dict[str, Any] | None = None
-        # M3 XFR-001 — if set, the Coordinator runs every public-capability
+        # M20 — when set, every emit is also published to
+        # the bus so a partner's SSE subscription sees the
+        # audit timeline live. The Coordinator itself
+        # doesn't know about HTTP / SSE; the bus is a
+        # generic pub/sub the API layer hooks into.
+        self._event_bus = event_bus
         # adapter call through the EgressPEP. Local tools, sinks, and
         # in-process nodes never see the PEP.
         self._egress_pep: EgressPEP | None = egress_pep
@@ -290,6 +297,8 @@ class Coordinator:
                     kind=EventKind.TASK_FAILED,
                     payload={"reason": "rejected at human_approval"},
                 )
+                if self._event_bus is not None:
+                    self._event_bus.close(task_run_id)
                 return CoordinatorResult(
                     task_run_id=task_run_id,
                     plan=plan,
@@ -322,6 +331,8 @@ class Coordinator:
                 kind=EventKind.TASK_FAILED,
                 payload={"reason": str(e), "error_type": type(e).__name__},
             )
+            if self._event_bus is not None:
+                self._event_bus.close(task_run_id)
             return CoordinatorResult(
                 task_run_id=task_run_id,
                 plan=plan,
@@ -333,6 +344,12 @@ class Coordinator:
 
         # Final pass: verify all receipts.
         verified = self._verify_receipts(task_run_id)
+        # M20 — close the live event bus so SSE
+        # subscribers see the close sentinel and exit
+        # their read loop. The history stays; the bus
+        # just stops accepting new events.
+        if self._event_bus is not None:
+            self._event_bus.close(task_run_id)
         return CoordinatorResult(
             task_run_id=task_run_id,
             plan=plan,
@@ -444,8 +461,10 @@ class Coordinator:
 
         # Issue a Node Grant. The grant's data view is the *first* input
         # view of the plan node (P0 is single-view per node).
-        data_view = plan_node.input_views[0] if plan_node.input_views else DataView(
-            name="default", shape="reference", fields=[]
+        data_view = (
+            plan_node.input_views[0]
+            if plan_node.input_views
+            else DataView(name="default", shape="reference", fields=[])
         )
         grant = self._grant_issuer.issue(
             task_run_id=task_run_id,
@@ -457,9 +476,7 @@ class Coordinator:
             data_view=data_view,
             purpose=plan_node.purpose,
         )
-        self._store.save_grant(
-            {**grant.model_dump(mode="json"), "signature": grant.signature}
-        )
+        self._store.save_grant({**grant.model_dump(mode="json"), "signature": grant.signature})
         self._emit(
             task_run_id=task_run_id,
             node_run_id=node_run_id,
@@ -474,9 +491,7 @@ class Coordinator:
 
         # Look up the adapter; raise clearly if missing.
         if cap_id not in self._adapters:
-            raise OrchestraError(
-                f"no adapter registered for capability {cap_id!r}"
-            )
+            raise OrchestraError(f"no adapter registered for capability {cap_id!r}")
         adapter = self._adapters[cap_id]
         started_at = utc_now_iso()
         inputs: dict[str, Any] = dict(previous_outputs)
@@ -537,7 +552,8 @@ class Coordinator:
 
             proj = FieldProjector()
             proj_result = proj.project(
-                _manifest_for_projection(manifest_dict), inputs,
+                _manifest_for_projection(manifest_dict),
+                inputs,
             )
             egress_projection = projected
             egress_manifest = manifest_dict
@@ -554,7 +570,9 @@ class Coordinator:
                     data_view=data_view,
                     purpose=plan_node.purpose,
                     timeout_ms=plan_node.timeout_ms,
-                    metadata={"decided_by": approval_payload.get("decided_by", "human")} if approval_payload else {},
+                    metadata={"decided_by": approval_payload.get("decided_by", "human")}
+                    if approval_payload
+                    else {},
                 )
             )
         except Exception as e:  # noqa: BLE001
@@ -565,7 +583,11 @@ class Coordinator:
                 task_run_id=task_run_id,
                 node_run_id=node_run_id,
                 kind=EventKind.NODE_FAILED,
-                payload={"node_id": plan_node.node_id, "error": str(e), "error_type": type(e).__name__},
+                payload={
+                    "node_id": plan_node.node_id,
+                    "error": str(e),
+                    "error_type": type(e).__name__,
+                },
             )
             raise
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -576,7 +598,11 @@ class Coordinator:
             task_run_id=task_run_id,
             node_run_id=node_run_id,
             kind=EventKind.IO_INTENT,
-            payload={"node_id": plan_node.node_id, "capability_id": cap_id, "data_view": data_view.name},
+            payload={
+                "node_id": plan_node.node_id,
+                "capability_id": cap_id,
+                "data_view": data_view.name,
+            },
         )
         if egress_manifest is not None:
             # XFR-001 path: the io.sent event carries the projected
@@ -676,6 +702,21 @@ class Coordinator:
             payload=payload,
         )
         self._store.append_event(ev)
+        # M20 — mirror the event into the live bus so a
+        # partner's SSE subscription sees it in real
+        # time. The bus mirrors what was already persisted;
+        # a partner who lost the connection can recover
+        # by reading ``GET /tasks/{id}/events``.
+        if self._event_bus is not None:
+            self._event_bus.publish(
+                task_run_id,
+                {
+                    "task_run_id": task_run_id,
+                    "node_run_id": node_run_id,
+                    "kind": kind.value if hasattr(kind, "value") else str(kind),
+                    "payload": payload,
+                },
+            )
 
     def _sign_plan(self, plan: ExecutionPlan) -> str:
         from orchestra.core.hashing import hmac_sign
@@ -711,7 +752,9 @@ class Coordinator:
             "requested_at": utc_now_iso(),
             "task_run_id": task_run_id,
             "node_id": node_id,
-            "request": {k: v for k, v in request_payload.items() if isinstance(v, (str, int, float, bool))},
+            "request": {
+                k: v for k, v in request_payload.items() if isinstance(v, (str, int, float, bool))
+            },
         }
         self._approval_events[(task_run_id, node_id)] = (event, bucket)
         self._store.save_approval(
@@ -771,9 +814,7 @@ def _deterministic_merge(inputs: dict[str, Any]) -> dict[str, Any]:
             "regulatory_actions": [],
             "source": "in-repo A2A Reference Agent",
         }
-    industry_context = research.get("industry_context", {}) or research.get(
-        "a2a_artefact", {}
-    )
+    industry_context = research.get("industry_context", {}) or research.get("a2a_artefact", {})
     risk_flags: list[str] = []
     contract_amount = facts.get("contract_amount", "")
     if contract_amount:
@@ -817,6 +858,7 @@ def build_default_coordinator(
     store: EventStore,
     endpoints: dict[str, str] | None = None,
     egress_pep: EgressPEP | None = None,
+    event_bus: Any = None,
 ) -> Coordinator:
     """Construct a Coordinator with the default registry, policy, and
     four reference Adapters.
@@ -856,6 +898,7 @@ def build_default_coordinator(
         grant_issuer=grant_issuer,
         receipt_builder=receipt_builder,
         egress_pep=egress_pep,
+        event_bus=event_bus,
     )
 
 
@@ -871,9 +914,7 @@ def _build_default_adapters(endpoints: dict[str, str]) -> dict[str, Adapter]:
 
     return {
         "local.contract-extractor": LocalModelAdapter(
-            endpoint=endpoints.get(
-                "local.contract-extractor", "http://127.0.0.1:8101/v1/extract"
-            )
+            endpoint=endpoints.get("local.contract-extractor", "http://127.0.0.1:8101/v1/extract")
         ),
         "public.openai-compat": OpenAICompatAdapter(
             endpoint=endpoints.get(

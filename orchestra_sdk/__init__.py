@@ -47,6 +47,7 @@ from __future__ import annotations
 from typing import Any
 
 from orchestra_sdk.client import (
+    EventStream,
     OrchestraClient,
     TaskStatus,
     TaskEvent,
@@ -68,6 +69,7 @@ from orchestra_sdk.errors import (
 
 __all__ = [
     "OrchestraClient",
+    "EventStream",
     "TaskStatus",
     "TaskEvent",
     "TaskReceipt",

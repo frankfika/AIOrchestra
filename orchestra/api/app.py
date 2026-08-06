@@ -65,6 +65,10 @@ class AppState:
     # in-memory ring buffer; production swaps for a durable
     # store.
     webhook_history: Any = None  # DeliveryHistory | None
+    # M20 — per-task live event bus. The Coordinator publishes
+    # every audit event here in addition to the EventStore so
+    # a partner's SSE subscription sees the timeline live.
+    event_bus: Any = None  # EventBus | None
 
 
 def _default_data_label() -> SecurityLabel:
@@ -661,6 +665,88 @@ def create_app(state: AppState | None = None) -> FastAPI:
         return {"task_run_id": task_run_id, "count": len(events), "events": events}
 
     @app.get(
+        "/tasks/{task_run_id}/events/stream",
+        summary="Stream task events over Server-Sent Events (SSE)",
+        tags=["Tasks"],
+        responses={
+            200: {
+                "description": (
+                    "An SSE stream of audit events. Each ``data:`` line is a JSON object. "
+                    "The connection closes when the task reaches a terminal state. "
+                    "Late subscribers see the per-task history first, then live events."
+                ),
+                "content": {
+                    "text/event-stream": {
+                        "example": 'data: {"task_run_id":"eafa3a59","kind":"task.received","payload":{"contract_id":"ctr-2024-001"}}\n\n',
+                    }
+                },
+            },
+        },
+    )
+    async def stream_events(task_run_id: str):
+        """Stream audit events for a task as Server-Sent Events.
+
+        The format is the standard ``text/event-stream`` (one
+        ``data: <json>`` line per event, blank line separator).
+        A late subscriber sees the per-task history first,
+        then live events. The connection closes when the
+        task reaches a terminal state (the bus sends a
+        ``None`` sentinel that the handler turns into a
+        final ``event: done`` line and a clean close).
+        """
+        from fastapi.responses import StreamingResponse
+        import json as _json
+
+        bus = getattr(state, "event_bus", None)
+        if bus is None:
+            # No bus wired; the dev path should always have
+            # one, but defensive: 503.
+            return Response(
+                content=_json.dumps(
+                    {
+                        "type": "urn:orchestra:problem:dependency_failure",
+                        "title": "Event bus is not initialised.",
+                        "status": 503,
+                        "detail": "no event bus; check app bootstrap",
+                    }
+                ),
+                status_code=503,
+                media_type="application/problem+json",
+            )
+
+        # Pre-fill the per-task history (so a partner who
+        # subscribes mid-task sees the audit context).
+        history = bus.replay(task_run_id)
+        if not history and bus.is_closed(task_run_id):
+            # The task is already terminal AND we have no
+            # history (e.g. process restart). Emit a single
+            # close event so the client doesn't hang.
+            async def empty():
+                yield "event: done\ndata: {}\n\n"
+
+            return StreamingResponse(empty(), media_type="text/event-stream")
+
+        async def event_stream():
+            sub_queue = await bus.subscribe(task_run_id)
+            try:
+                # The subscriber's queue is pre-filled
+                # with the per-task history, then live
+                # events, then a None sentinel on close.
+                # Read until the sentinel; emit a
+                # ``data:`` line for every event and a
+                # terminal ``event: done`` line.
+                while True:
+                    ev = await sub_queue.get()
+                    if ev is None:
+                        yield "event: done\ndata: {}\n\n"
+                        break
+                    yield f"data: {_json.dumps(ev, default=str)}\n\n"
+            finally:
+                bus.unsubscribe(task_run_id, sub_queue)
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.get(
         "/tasks/{task_run_id}/receipts",
         summary="List signed receipts (with verification status)",
         tags=["Tasks"],
@@ -1152,16 +1238,23 @@ def _bootstrap_default_state() -> AppState:
     from orchestra.coordinator.engine import build_default_coordinator
     from orchestra.observability import Metrics, builtin_metrics
     from orchestra.runtime.rate_limit import RateLimiter, TokenBucket
+    from orchestra.streaming import EventBus
     from orchestra.webhooks import DeliveryHistory, WebhookDispatcher
 
     endpoints_obj = start_all_servers()
     endpoints = {k: v["endpoint"] for k, v in endpoints_obj.items()}
     store = EventStore()
     store.connect()
-    coordinator = build_default_coordinator(store=store, endpoints=endpoints)
+    # M20 — the bus is constructed before the Coordinator so
+    # the Coordinator can publish into it from the first
+    # ``_emit`` call.
+    event_bus = EventBus()
+    coordinator = build_default_coordinator(store=store, endpoints=endpoints, event_bus=event_bus)
     runner = BenchmarkRunner(
         store=store,
-        coordinator_factory=lambda: build_default_coordinator(store=store, endpoints=endpoints),
+        coordinator_factory=lambda: build_default_coordinator(
+            store=store, endpoints=endpoints, event_bus=event_bus
+        ),
     )
     # M14 — wire a per-tenant token-bucket rate limiter. The dev
     # default is permissive (1000 RPS, 1000 burst) so local testing
@@ -1188,6 +1281,7 @@ def _bootstrap_default_state() -> AppState:
         max_request_bytes=max_body,
         webhook_dispatcher=WebhookDispatcher(),
         webhook_history=DeliveryHistory(),
+        event_bus=event_bus,
     )
 
 
