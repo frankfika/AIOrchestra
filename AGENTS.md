@@ -54,7 +54,8 @@ may not silently resolve them.
 | **M18** | `1be746e` | Webhook delivery history + OpenAPI request/response examples. Partner whose webhook never fires queries ``GET /admin/webhooks/{task_id}`` to see attempts + last error. ``POST /tasks`` ships a copy-pasteable requestBody example + 200/422/429 response examples in ``/docs`` so a partner SDK generator has a real shape. | `orchestra.webhooks.history`, `orchestra.api.app` |
 | **M19** | `4f59baf` | Webhook manual retry: ``POST /admin/webhooks/{task_id}/retry`` re-fires the latest failed delivery using the stored URL + secret. A SRE notices a flaky partner is back online, hits one endpoint, partner's dedup logic sees a fresh ``delivery_id``. Original record stays in history; new record is appended alongside. | `orchestra.webhooks.history`, `orchestra.api.app` |
 | **M20** | `14a1f40` | SSE streaming task events: ``GET /tasks/{task_run_id}/events/stream`` returns a live Server-Sent Events feed of the audit timeline. Late subscribers see the per-task history first, then live events, then ``event: done`` on terminal state. SDK gets ``stream_events(task_id)`` iterable. Push + webhook + poll, three ways to consume the same timeline. | `orchestra.streaming`, `orchestra.coordinator.engine`, `orchestra_sdk` |
-| **M21** | (in flight) | ADR rollout: 8 new ADRs (0004–0011) capture the M1–M20 design rationale (Trust Compiler in-process, Egress PEP field projection, HMAC bearer tokens, tenant isolation at storage layer, token-bucket rate limit, RFC 7807 errors, HMAC-signed webhooks, in-process SSE bus) + ``ADR/README.md`` index. A partner integrator reads 0005+0006+0009+0010; a SRE reads 0007+0008+0011. | `ADR/` |
+| **M21** | `f154d50` | ADR rollout: 8 new ADRs (0004–0011) capture the M1–M20 design rationale (Trust Compiler in-process, Egress PEP field projection, HMAC bearer tokens, tenant isolation at storage layer, token-bucket rate limit, RFC 7807 errors, HMAC-signed webhooks, in-process SSE bus) + ``ADR/README.md`` index. A partner integrator reads 0005+0006+0009+0010; a SRE reads 0007+0008+0011. | `ADR/` |
+| **M22** | (in flight) | Pilot-readiness closing report: ``docs/pilot-readiness.md`` maps the white paper P0–M7 roadmap + the M8–M21 polish to current shipped state, audits the 26 safety invariants (24 ✅ / 2 ⚠️ partial, both have schema + audit in place; full UX is M23+), and provides the production-swap handoff (config-only swaps vs. real-third-party-cred swaps vs. partner/legal-input swaps). The dev path is complete; remaining work is operational and needs Frank's partner / cloud / legal inputs. | `docs/pilot-readiness.md` |
 
 248 tests pass; 19 intentionally skipped (clean-room install +
 M1+ invariants that need M1+ features). M13 adds 32 tests
@@ -71,7 +72,9 @@ example coverage) for a total of 360 active. M19 adds 9
 tests (last-failed lookup, retry endpoint, stored config
 re-use, new delivery_id) for a total of 369 active. M20
 adds 6 tests (event bus primitive + SSE endpoint shape)
-for a total of 375 active.
+for a total of 375 active. M21 ships 0 tests (no code change,
+ADR rollout only). M22 ships 0 tests (doc-only closing
+artifact); 375 active.
 
 ### Historical P0 boundary (preserved for traceability)
 
@@ -160,6 +163,7 @@ implements the subset actually used.
 | Helm chart | `deploy/helm/` |
 | Runbooks | `docs/runbooks/` |
 | Pilot walkthrough | `docs/walkthrough-publishing.md` |
+| Pilot-readiness closing report | `docs/pilot-readiness.md` |
 | GA evidence example | `docs/ga-evidence-example.md` |
 | Security policy | `SECURITY.md` |
 | ADRs | `ADR/` |

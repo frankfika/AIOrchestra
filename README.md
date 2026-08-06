@@ -142,6 +142,7 @@ production swap's KMS / OIDC verifier will be the bottleneck.
 - [`docs/runbooks/backup-restore.md`](./docs/runbooks/backup-restore.md) — RPO 60s, RTO 15m
 - [`docs/runbooks/rollback.md`](./docs/runbooks/rollback.md) — Kill Switch, plan amendment, credential rotation
 - [`docs/walkthrough-publishing.md`](./docs/walkthrough-publishing.md) — pilot / investor narrative
+- [`docs/pilot-readiness.md`](./docs/pilot-readiness.md) — **M22 closing report**: roadmap → shipped map, 26-invariant audit, production-swap handoff
 
 ## ADRs
 
