@@ -6,8 +6,6 @@ on the agent side; the receipt is what proves the write.
 """
 from __future__ import annotations
 
-from typing import Any
-
 import httpx
 
 from orchestra.adapters.base import AdapterRequest, AdapterResult

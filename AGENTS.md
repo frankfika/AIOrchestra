@@ -7,9 +7,9 @@ on every change. Higher-priority rules (orchestra/白皮书, /开发计划)
 win on conflict; this file is the bridge between those documents
 and the agent's daily decisions.
 
-> **Status: M0–M11 shipped.** The original P0 matrix in §2 is
+> **Status: M0–M12 shipped.** The original P0 matrix in §2 is
 > preserved for traceability; the actual production surface is
-> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11.
+> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11 + M12.
 > The "P0 not-in-scope" column is the **historical** P0 boundary;
 > the dev plan moved those items to M1+ in later milestones.
 
@@ -46,9 +46,12 @@ may not silently resolve them.
 | **M10** | `e97450a` | README update (M0–M9 reality) | `README.md` |
 | **M11** | `88965df` | SECURITY.md + GA evidence example + CLI `doctor` | `SECURITY.md`, `docs/ga-evidence-example.md` |
 | **M12** | in flight | Fix /healthz (real cluster state) + AGENTS.md update + property-based tests | — |
+| **M13** | (in flight) | Dep security upgrade (fastapi>=0.116, pytest>=9.0.3, fixed 9 CVEs) + Prometheus metrics (`/metrics` text-format + HTTPMetricsMiddleware + EgressPEP/ReleaseGate/Ingress/PublishedRegistry counters) + ruff + pre-commit hooks | `orchestra.observability`, `.pre-commit-config.yaml` |
 
-243 tests pass; 19 intentionally skipped (clean-room install +
-M1+ invariants that need M1+ features).
+248 tests pass; 19 intentionally skipped (clean-room install +
+M1+ invariants that need M1+ features). M13 adds 32 tests
+(metrics primitives + instrumentation + endpoint) for a total
+of 280 active.
 
 ### Historical P0 boundary (preserved for traceability)
 
@@ -124,6 +127,7 @@ implements the subset actually used.
 | Publishing (Cards, Registry, Ingress, Kill Switch, Release Gate) | `orchestra/publishing/` |
 | Multi-tenant isolation | `orchestra/enterprise/isolation.py` |
 | GA readiness + SLO calculator | `orchestra/ga/` |
+| Observability (Prometheus metrics + HTTP middleware) | `orchestra/observability/` |
 | CLI | `orchestra/cli.py` |
 | Demo Console (HTML) | `orchestra/ux/` |
 | Helm chart | `deploy/helm/` |
@@ -133,8 +137,8 @@ implements the subset actually used.
 | Security policy | `SECURITY.md` |
 | ADRs | `ADR/` |
 | Sample tenant / Agent Card | `data/samples/tenants.py` |
-| Tests | `tests/m{0..12}/` |
-| Verification command | `pytest tests/` (243 pass, 19 skipped) |
+| Tests | `tests/m{0..13}/` |
+| Verification command | `pytest tests/` (280 pass, 19 skipped) |
 
 ## 7. Production swap checklist (M6 → production)
 

@@ -14,14 +14,12 @@ path so the evidence can be verified out-of-band.
 """
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 
-from orchestra.core.hashing import hmac_keygen, hmac_sign, hmac_verify
+from orchestra.core.hashing import hmac_sign, hmac_verify
 from orchestra.core.ids import new_id
 from orchestra.core.time import utc_now_iso
-from orchestra.ga.slo import GAReadiness, evaluate_ga_readiness, PilotTelemetry
+from orchestra.ga.slo import GAReadiness, PilotTelemetry, evaluate_ga_readiness
 
 
 @dataclass
@@ -44,8 +42,8 @@ class PilotEvidence:
     telemetry: PilotTelemetry
     readiness: GAReadiness
     captured_at: str
-    signature: Optional[str] = None
-    kid: Optional[str] = None
+    signature: str | None = None
+    kid: str | None = None
 
     def to_signable(self) -> dict:
         return {

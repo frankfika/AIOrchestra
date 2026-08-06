@@ -16,7 +16,7 @@ from __future__ import annotations
 import contextvars
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Iterable
+from typing import Any
 
 from orchestra.core.errors import OrchestraError
 

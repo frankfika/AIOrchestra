@@ -13,12 +13,19 @@ The Egress PEP wraps every public Adapter call. It enforces:
 The PEP records an ``io.sent`` event with the projected payload
 **digest** (never the raw payload) so the audit timeline shows
 *what* left the tenant without leaking it.
+
+M13 — when constructed with ``metrics=``, the PEP increments
+``orchestra_egress_pep_projection_total`` on success,
+``orchestra_egress_pep_denied_total`` on denial, and observes
+``orchestra_egress_pep_projection_bytes``. Without metrics, the
+PEP behaves exactly as before.
 """
+
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 from orchestra.core.errors import OrchestraError
 from orchestra.core.schema import (
@@ -26,7 +33,10 @@ from orchestra.core.schema import (
     EventKind,
     FieldManifest,
 )
-from orchestra.xfr.projector import FieldProjector, EgressBudgetExceeded
+from orchestra.xfr.projector import EgressBudgetExceeded, FieldProjector
+
+if TYPE_CHECKING:  # pragma: no cover
+    from orchestra.observability.metrics import Metrics
 
 
 class EgressDenied(OrchestraError):
@@ -37,11 +47,37 @@ class EgressPEP:
     def __init__(
         self,
         *,
-        manifest_lookup: Callable[[str, str], Optional[FieldManifest]],
+        manifest_lookup: Callable[[str, str], FieldManifest | None],
         # (capability_id, view_name) -> FieldManifest
+        metrics: Metrics | None = None,
     ) -> None:
         self._lookup = manifest_lookup
         self._projector = FieldProjector()
+        # M13 — claim the relevant metrics if the caller passed one.
+        # The Counter / Histogram objects are idempotent (Metrics.counter
+        # returns the same instance for the same name), so wiring them
+        # once in __init__ is safe even if multiple PEPs share a registry.
+        self._metrics = metrics
+        if metrics is not None:
+            self._m_projection = metrics.counter(
+                "orchestra_egress_pep_projection_total",
+                "Total EgressPEP projections.",
+                labels=("capability", "view"),
+            )
+            self._m_denied = metrics.counter(
+                "orchestra_egress_pep_denied_total",
+                "Total EgressPEP denials.",
+                labels=("capability", "view"),
+            )
+            self._m_bytes = metrics.histogram(
+                "orchestra_egress_pep_projection_bytes",
+                "Projected payload bytes.",
+                labels=("capability",),
+            )
+        else:
+            self._m_projection = None
+            self._m_denied = None
+            self._m_bytes = None
 
     def project(
         self,
@@ -53,13 +89,24 @@ class EgressPEP:
         """Apply the manifest and return (projected_payload, manifest_dict)."""
         manifest = self._lookup(capability_id, view_name)
         if manifest is None:
-            raise EgressDenied(
-                f"no FieldManifest for capability {capability_id} view {view_name}"
-            )
+            if self._m_denied is not None:
+                self._m_denied.inc(capability=capability_id, view=view_name)
+            raise EgressDenied(f"no FieldManifest for capability {capability_id} view {view_name}")
         try:
             result = self._projector.project(manifest, payload)
         except EgressBudgetExceeded as e:
+            if self._m_denied is not None:
+                self._m_denied.inc(capability=capability_id, view=view_name)
             raise EgressDenied(str(e)) from e
+        # Record the projection. Bytes is the JSON-encoded size of the
+        # projected payload — the same shape the audit timeline records.
+        if self._m_projection is not None:
+            self._m_projection.inc(capability=capability_id, view=view_name)
+        if self._m_bytes is not None:
+            projected_bytes = len(
+                json.dumps(result.projected, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            )
+            self._m_bytes.observe(projected_bytes, capability=capability_id)
         return result.projected, manifest.model_dump(mode="json")
 
     def audit_event(

@@ -1,19 +1,20 @@
 """FastAPI app for the P0 demo."""
+
 from __future__ import annotations
 
 import asyncio
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
 from pydantic import BaseModel
 
-from orchestra.benchmarks.runner import BenchmarkRunner, BenchmarkResult
+from orchestra.benchmarks.runner import BenchmarkResult, BenchmarkRunner
 from orchestra.coordinator.engine import Coordinator
-from orchestra.coordinator.event_store import EventStore, EventStoreUnavailable
+from orchestra.coordinator.event_store import EventStore
 from orchestra.core.ids import new_id
 from orchestra.core.schema import (
     DataClassification,
@@ -21,7 +22,12 @@ from orchestra.core.schema import (
     SourceTrust,
     TaskRunState,
 )
-from orchestra.registry.bootstrap import load_default_manifests
+from orchestra.observability import (
+    HTTPMetricsMiddleware,
+    Metrics,
+    builtin_metrics,
+    render_prometheus,
+)
 from orchestra.templates.contract_review import CONTRACT_REVIEW_TEMPLATE
 
 
@@ -30,6 +36,11 @@ class AppState:
     store: EventStore
     coordinator: Coordinator
     benchmark_runner: BenchmarkRunner | None = None
+    # M13 — Prometheus metrics registry. Owned by the app process;
+    # the ``/metrics`` route renders it and the HTTPMetricsMiddleware
+    # ticks the per-request counters. Production swaps the registry
+    # for prometheus_client / OTel without changing the wire format.
+    metrics: Metrics = field(default_factory=builtin_metrics)
 
 
 def _default_data_label() -> SecurityLabel:
@@ -68,8 +79,21 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        yield
-        state.store.close()
+        # M13 — flip the ``orchestra_up`` gauge to 1 so a SRE can
+        # alert on the process being live (the alternative — no
+        # metric at all — is ambiguous: a missing export could mean
+        # a down process, a missing metric, or a scrape problem).
+        # The gauge is registered by ``builtin_metrics()`` so this
+        # is just a .set() on the existing instance.
+        up_gauge = state.metrics.gauge(
+            "orchestra_up", "1 if the process is alive and serving requests."
+        )
+        up_gauge.set(1.0)
+        try:
+            yield
+        finally:
+            up_gauge.set(0.0)
+            state.store.close()
 
     app = FastAPI(
         title="Orchestra P0 API",
@@ -80,10 +104,15 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     # M9 — structured logging + per-request id.
     from orchestra.core.logging import RequestIdMiddleware, setup_logging
+
     if not getattr(state, "_logging_configured", False):
         setup_logging(level=os.environ.get("ORCHESTRA_LOG_LEVEL", "INFO"))
         state._logging_configured = True
     app.add_middleware(RequestIdMiddleware)
+    # M13 — per-request Prometheus metrics. The middleware records
+    # orchestra_http_requests_total and the request-duration histogram
+    # for every HTTP exchange (including /metrics itself).
+    app.add_middleware(HTTPMetricsMiddleware, metrics=state.metrics)
 
     # M3 UX-001/UX-002 — mount the HTML Demo Console. The router uses
     # a state_provider closure so it shares the same EventStore and
@@ -117,7 +146,8 @@ def create_app(state: AppState | None = None) -> FastAPI:
             caps = state.coordinator._router._store.all()  # noqa: SLF001
             n_caps = len(caps)
             checks["capabilities"] = {
-                "status": "ok", "count": n_caps,
+                "status": "ok",
+                "count": n_caps,
             }
             if n_caps == 0:
                 checks["capabilities"]["status"] = "fail"
@@ -129,12 +159,14 @@ def create_app(state: AppState | None = None) -> FastAPI:
         tenant_count = 0
         try:
             from orchestra.enterprise.isolation import IsolatingEventStore
+
             store = IsolatingEventStore()
             store.connect()
             try:
                 tenant_count = len(store.list_tenants())
                 checks["tenants"] = {
-                    "status": "ok", "count": tenant_count,
+                    "status": "ok",
+                    "count": tenant_count,
                 }
             finally:
                 store.close()
@@ -146,6 +178,26 @@ def create_app(state: AppState | None = None) -> FastAPI:
         if hasattr(state, "_registry"):
             n_published = len(state._registry._by_version)  # noqa: SLF001
         checks["published_cards"] = {"status": "ok", "count": n_published}
+        # M13 — keep the cardinality-bounded gauges fresh so a scrape
+        # that's not aligned with /healthz still sees a current count.
+        try:
+            state.metrics.gauge(
+                "orchestra_tenants_total", "Total tenants in the multi-tenant store."
+            ).set(float(tenant_count))
+            state.metrics.gauge(
+                "orchestra_capabilities_total", "Total registered capabilities."
+            ).set(float(checks["capabilities"].get("count", 0)))
+            # The published-cards gauge is owned by the Registry;
+            # only set it here if the registry isn't driving the
+            # gauge itself (e.g. CLI-only path without metrics).
+            if hasattr(state, "_registry") and not getattr(state._registry, "_metrics", None):
+                state.metrics.gauge(
+                    "orchestra_published_cards_total", "Total published Agent Cards."
+                ).set(float(n_published))
+        except Exception:  # noqa: BLE001
+            # Gauges are observability, not control flow; never
+            # let a metric failure make /healthz unhealthy.
+            pass
         return {
             "status": overall,
             "version": "0.1.0-m11",
@@ -156,6 +208,20 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "published_card_count": n_published,
         }
 
+    @app.get("/metrics")
+    def metrics() -> Response:
+        """Prometheus text-format metrics export.
+
+        The body is the standard ``text/plain; version=0.0.4``
+        exposition format. Any production scraper (Prometheus,
+        VictoriaMetrics, Grafana Agent) consumes it without a
+        custom adapter. The ``Content-Type`` is what
+        prometheus_client returns; matching it lets a SRE point
+        any standard scraper at this endpoint.
+        """
+        body = render_prometheus(state.metrics)
+        return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
     @app.get("/templates")
     def templates() -> dict[str, Any]:
         return CONTRACT_REVIEW_TEMPLATE.model_dump(mode="json")
@@ -163,7 +229,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
     @app.get("/capabilities")
     def capabilities() -> dict[str, Any]:
         return {
-            "manifests": [m.model_dump(mode="json") for m in state.coordinator._router._store.all()],
+            "manifests": [
+                m.model_dump(mode="json") for m in state.coordinator._router._store.all()
+            ],
             "policy_rule_count": len(state.coordinator._router._policy._rules),
         }
 
@@ -257,8 +325,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
     async def approve(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         try:
             await state.coordinator.decide_approval(
-                task_run_id, "human_approval",
-                decision="approve", decided_by=body.decided_by, rationale=body.rationale,
+                task_run_id,
+                "human_approval",
+                decision="approve",
+                decided_by=body.decided_by,
+                rationale=body.rationale,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, str(e))
@@ -268,8 +339,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
     async def reject(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         try:
             await state.coordinator.decide_approval(
-                task_run_id, "human_approval",
-                decision="reject", decided_by=body.decided_by, rationale=body.rationale,
+                task_run_id,
+                "human_approval",
+                decision="reject",
+                decided_by=body.decided_by,
+                rationale=body.rationale,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, str(e))
@@ -309,7 +383,9 @@ def create_app(state: AppState | None = None) -> FastAPI:
     @app.post("/api/v1/orchestra/tasks/{task_run_id}/decide")
     async def ah_decide(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         """Decide a pending approval (approve / reject)."""
-        decision = body.decided_by and "approve" or "approve"  # body has no decision; use path default
+        decision = (
+            body.decided_by and "approve" or "approve"
+        )  # body has no decision; use path default
         # We piggy-back on the JSON API's approve / reject routes by
         # reading ``decided_by`` and ``rationale``; the AgenticHub
         # shape doesn't carry an explicit decision in the body, so we
@@ -317,8 +393,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
         # AgenticHub) decides which path to call.
         try:
             await state.coordinator.decide_approval(
-                task_run_id, "human_approval",
-                decision="approve", decided_by=body.decided_by, rationale=body.rationale,
+                task_run_id,
+                "human_approval",
+                decision="approve",
+                decided_by=body.decided_by,
+                rationale=body.rationale,
             )
         except Exception as e:  # noqa: BLE001
             raise HTTPException(400, str(e))
@@ -334,10 +413,15 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     @app.post("/admin/tenants")
     def admin_create_tenant(body: dict) -> dict:
-        from orchestra.enterprise.tenant import (
-            Tenant, TenantContext, TenantRole, reset_active, set_active,
-        )
         from orchestra.enterprise.isolation import IsolatingEventStore
+        from orchestra.enterprise.tenant import (
+            Tenant,
+            TenantContext,
+            TenantRole,
+            reset_active,
+            set_active,
+        )
+
         tid = body.get("tenant_id")
         if not tid or not isinstance(tid, str):
             raise HTTPException(422, "tenant_id must be a non-empty string")
@@ -360,10 +444,15 @@ def create_app(state: AppState | None = None) -> FastAPI:
 
     @app.get("/admin/tenants")
     def admin_list_tenants() -> dict:
-        from orchestra.enterprise.tenant import (
-            Tenant, TenantContext, TenantRole, reset_active, set_active,
-        )
         from orchestra.enterprise.isolation import IsolatingEventStore
+        from orchestra.enterprise.tenant import (
+            Tenant,
+            TenantContext,
+            TenantRole,
+            reset_active,
+            set_active,
+        )
+
         ctx = TenantContext(
             tenant=Tenant(tenant_id="tenant:demo", name="demo"),
             caller_id="cli",
@@ -387,8 +476,10 @@ def create_app(state: AppState | None = None) -> FastAPI:
         the dev key. The CLI's ``orchestra publish create`` calls
         this."""
         from pydantic import ValidationError
+
         from orchestra.core.hashing import hmac_keygen
-        from orchestra.publishing.card import AgentCard, CardStatus, sign_card
+        from orchestra.publishing.card import AgentCard, CardStatus
+
         # The dev key is a per-process generated key. Production
         # swaps the signer for the M6 KMS — see ENT-003.
         if not hasattr(state, "_publish_key"):
@@ -398,7 +489,12 @@ def create_app(state: AppState | None = None) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(422, detail=e.errors())
         from orchestra.publishing.registry import PublishedRegistry
-        registry = PublishedRegistry(default_key=state._publish_key, default_kid="key-cli-1")
+
+        registry = PublishedRegistry(
+            default_key=state._publish_key,
+            default_kid="key-cli-1",
+            metrics=state.metrics,
+        )
         # Carry over previously published cards so the registry
         # isn't cleared on every CLI call (the app is a single
         # process; this is the dev shape).
@@ -406,6 +502,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
             registry._by_version = dict(state._registry._by_version)
             registry._latest = dict(state._registry._latest)
             registry._by_partner = {k: set(v) for k, v in state._registry._by_partner.items()}
+            # M13 — preserve the metrics handle so the gauge stays
+            # consistent across multiple CLI / admin calls.
+            registry._metrics = state._registry._metrics
+            if registry._m_published_gauge is not None:
+                registry._m_published_gauge.set(float(len(registry._by_version)))
         signed = registry.publish(card, key=state._publish_key, kid="key-cli-1")
         state._registry = registry
         return signed.model_dump(mode="json")
@@ -416,12 +517,14 @@ def create_app(state: AppState | None = None) -> FastAPI:
             return {"cards": []}
         out = []
         for (cid, ver), entry in state._registry._by_version.items():
-            out.append({
-                "capability_id": cid,
-                "version": ver,
-                "status": entry.card.status.value,
-                "partner_id": entry.card.partner_id,
-            })
+            out.append(
+                {
+                    "capability_id": cid,
+                    "version": ver,
+                    "status": entry.card.status.value,
+                    "partner_id": entry.card.partner_id,
+                }
+            )
         return {"cards": out}
 
     @app.post("/admin/publish/{capability_id}/{version}/revoke")

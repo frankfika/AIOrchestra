@@ -26,19 +26,16 @@ from orchestra.compiler.errors import CompileError, CompileErrorKind
 from orchestra.compiler.normalizer import NormalizedGraph
 from orchestra.core.schema import (
     CapabilityKind,
-    CapabilityManifest,
-    DataClassification,
     Effect,
     EffectKind,
     NodeSpec,
     SecurityLabel,
-    SourceTrust,
 )
 from orchestra.registry.bootstrap import (
     load_default_manifests,
     load_default_policy,
 )
-from orchestra.registry.eligible import EligibleSet, compute_eligible_set
+from orchestra.registry.eligible import EligibleSet
 from orchestra.registry.policy import PolicyEngine
 from orchestra.registry.router import Router
 
@@ -80,7 +77,7 @@ class Resolver:
         data_label: SecurityLabel,
         region: str = "local",
         budget_usd: float = 1.0,
-        template: "TaskTemplate | None" = None,
+        template: TaskTemplate | None = None,
     ) -> ResolverResult:
         bindings: dict[str, str] = {}
         manifest_bindings: dict[str, str] = {}
@@ -178,7 +175,7 @@ class Resolver:
         data_label: SecurityLabel,
         region: str = "local",
         budget_usd: float = 1.0,
-        template: "TaskTemplate | None" = None,
+        template: TaskTemplate | None = None,
     ) -> ResolverResult:
         """Plan Amendment (invariant #6): re-resolve when a chosen
         capability becomes unavailable.

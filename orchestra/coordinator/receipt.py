@@ -18,13 +18,11 @@ the end of a run.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 from typing import Any
 
 from orchestra.core.hashing import cose_like_envelope, verify_cose_like
 from orchestra.core.ids import digest_json, new_id
-from orchestra.core.schema import AuditEvent, SignedReceipt
+from orchestra.core.schema import SignedReceipt
 from orchestra.core.time import utc_now_iso
 
 

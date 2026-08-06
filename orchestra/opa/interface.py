@@ -1,22 +1,12 @@
 """M1 POL-001 — PDP interface, OPA HTTP client, in-process default."""
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
 
 from orchestra.core.errors import OrchestraError
-from orchestra.core.schema import (
-    CapabilityManifest,
-    DataClassification,
-    Effect,
-    EffectKind,
-    NodeSpec,
-    SecurityLabel,
-    SourceTrust,
-)
 from orchestra.registry.policy import (
     PolicyDecision,
     PolicyEngine,

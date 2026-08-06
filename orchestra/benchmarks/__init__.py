@@ -37,20 +37,20 @@ The ``paretok`` verdict is True if ``hybrid`` is *not* dominated by both
 axes).
 """
 from orchestra.benchmarks.manifest import (
-    BenchmarkManifest,
-    BaselineSpec,
-    MetricSpec,
     DEFAULT_P0_MANIFEST,
+    BaselineSpec,
+    BenchmarkManifest,
+    MetricSpec,
     manifest_id,
 )
 from orchestra.benchmarks.runner import (
-    BenchmarkRunner,
-    BenchmarkResult,
+    GROUND_TRUTH,
     BaselineResult,
-    build_hybrid_runner,
+    BenchmarkResult,
+    BenchmarkRunner,
     build_all_local_runner,
     build_all_public_runner,
-    GROUND_TRUTH,
+    build_hybrid_runner,
 )
 
 __all__ = [

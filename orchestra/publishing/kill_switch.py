@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from orchestra.publishing.card import AgentCard, CardStatus
 from orchestra.publishing.registry import PublishedRegistry
@@ -43,7 +42,7 @@ class KillSwitch:
     M5 test suite can verify the bounded-effect guarantee.
     """
 
-    tripped_at: Optional[float] = None
+    tripped_at: float | None = None
     reason: str = ""
     max_effect_seconds: float = 5.0
     history: list[dict] = field(default_factory=list)

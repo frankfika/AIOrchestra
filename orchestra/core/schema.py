@@ -20,9 +20,8 @@ M0 extends P0 with:
 """
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -79,7 +78,7 @@ class SecurityLabel(BaseModel):
     retention_days: int = Field(default=30, ge=0)
     owner: str = Field(default="tenant:root", description="owner identifier")
 
-    def can_flow_to(self, other: "SecurityLabel") -> bool:
+    def can_flow_to(self, other: SecurityLabel) -> bool:
         """Conservative flow check: classification must flow to an
         equal-or-stricter context, and residency must be compatible.
 
@@ -129,7 +128,7 @@ class EffectKind(str, Enum):
 class Effect(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: EffectKind
-    target: Optional[str] = Field(default=None, description="logical target name")
+    target: str | None = Field(default=None, description="logical target name")
 
 
 class Purpose(BaseModel):
@@ -152,7 +151,7 @@ class DataView(BaseModel):
     name: str
     shape: Literal["reference", "fields"]
     fields: list[str] = Field(default_factory=list)
-    source: Optional[str] = Field(default=None, description="logical source ref")
+    source: str | None = Field(default=None, description="logical source ref")
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +206,7 @@ class CapabilityManifest(BaseModel):
     # through the EgressPEP under this FieldManifest view before sending.
     # Capabilities without a view never see the PEP (local tools, sinks,
     # in-process nodes, etc.).
-    egress_view_name: Optional[str] = Field(
+    egress_view_name: str | None = Field(
         default=None,
         description="FieldManifest view to project the egress through (M3 XFR-001)",
     )
@@ -234,7 +233,7 @@ class NodeSpec(BaseModel):
     eligible_capability_kinds: list[CapabilityKind] = Field(default_factory=list)
     declared_effects: list[Effect] = Field(default_factory=list)
     requires_approval: bool = False
-    fallback_capability_id: Optional[str] = Field(
+    fallback_capability_id: str | None = Field(
         default=None,
         description="pre-approved Fallback; must be set in P0 (plan §0.1.1 P0 row)",
     )
@@ -293,9 +292,9 @@ class ApprovalSpec(BaseModel):
     approval_id: str = Field(default_factory=new_id)
     node_id: str
     requested_at: str = Field(default_factory=utc_now_iso)
-    decided_at: Optional[str] = None
-    decision: Optional[Literal["approve", "reject"]] = None
-    decided_by: Optional[str] = None
+    decided_at: str | None = None
+    decision: Literal["approve", "reject"] | None = None
+    decided_by: str | None = None
     rationale: str = ""
 
 
@@ -328,7 +327,7 @@ class PlanNode(BaseModel):
     input_views: list[DataView]
     expected_outputs: list[str]
     timeout_ms: int
-    fallback_capability_id: Optional[str] = None
+    fallback_capability_id: str | None = None
     requires_approval: bool = False
     status: Literal["pending", "running", "succeeded", "failed", "awaiting-approval"] = "pending"
 
@@ -354,7 +353,7 @@ class ExecutionPlan(BaseModel):
     routing: list[RoutingDecision] = Field(default_factory=list)
     created_at: str = Field(default_factory=utc_now_iso)
     signed_by: str = "p0-local-signer"
-    signature: Optional[str] = Field(
+    signature: str | None = Field(
         default=None, description="HMAC over canonical JSON, base64url"
     )
 
@@ -425,7 +424,7 @@ class NodeGrant(BaseModel):
     not_before: str = Field(default_factory=utc_now_iso)
     expires_at: str
     audience: str = "p0"
-    signature: Optional[str] = None
+    signature: str | None = None
 
     @field_validator("expires_at")
     @classmethod
@@ -479,13 +478,13 @@ class AuditEvent(BaseModel):
 
     event_id: str = Field(default_factory=new_id)
     seq: int = Field(default=0, description="monotonic per task_run_id")
-    task_run_id: Optional[str] = None
-    node_run_id: Optional[str] = None
+    task_run_id: str | None = None
+    node_run_id: str | None = None
     kind: EventKind
     occurred_at: str = Field(default_factory=utc_now_iso)
     actor: str = "orchestra"
     payload: dict[str, Any] = Field(default_factory=dict)
-    prev_event_id: Optional[str] = None
+    prev_event_id: str | None = None
 
     def event_id_content(self) -> str:
         """Stable ID if we ever want to dedupe (test helper)."""
@@ -554,9 +553,9 @@ class ValueRef(BaseModel):
     ref_id: str = Field(default_factory=new_id)
     producer_node_id: str
     producer_output: str = Field(description="logical output name of the producer")
-    view_name: Optional[str] = Field(default=None, description="resolved DataView name")
+    view_name: str | None = Field(default=None, description="resolved DataView name")
     type_hint: Literal["text", "json", "binary", "reference", "stream"] = "json"
-    label: Optional[SecurityLabel] = Field(
+    label: SecurityLabel | None = Field(
         default=None,
         description="label of the data at the time of ValueRef resolution",
     )
@@ -607,11 +606,11 @@ class InformationFlowRule(BaseModel):
     rule_id: str
     join: JoinSemantics = JoinSemantics.JOIN
     # Optional explicit override (used when join=EXPLICIT).
-    explicit_output_label: Optional[SecurityLabel] = None
+    explicit_output_label: SecurityLabel | None = None
     # Restrict to specific input refs (default: all inputs).
     input_refs: list[str] = Field(default_factory=list)
     # If set, the rule applies only to outputs of this name.
-    output_name: Optional[str] = None
+    output_name: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +637,7 @@ class FieldManifest(BaseModel):
         default_factory=list,
         description="list of {field, op: 'drop'|'hash'|'tokenize'|'partial-<n>'}",
     )
-    byte_budget: Optional[int] = Field(
+    byte_budget: int | None = Field(
         default=None,
         description="max bytes the projected payload may consume (Pareto-style enforcement)",
     )
@@ -655,9 +654,9 @@ class CitationSourceRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
     kind: Literal["node-output", "external-url", "external-doc", "synthetic"]
     ref: str
-    version: Optional[str] = None
-    retrieved_at: Optional[str] = None
-    label: Optional[SecurityLabel] = None
+    version: str | None = None
+    retrieved_at: str | None = None
+    label: SecurityLabel | None = None
 
 
 class Citation(BaseModel):

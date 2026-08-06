@@ -13,14 +13,17 @@ NOT retire the old one; both stay published until the old Card is
 explicitly deprecated or revoked. This is what lets partners
 upgrade on their own schedule (PUB-003).
 """
+
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from orchestra.core.errors import OrchestraError
 from orchestra.publishing.card import AgentCard, CardStatus, sign_card
+
+if TYPE_CHECKING:  # pragma: no cover
+    from orchestra.observability.metrics import Metrics
 
 
 class PublishError(OrchestraError):
@@ -35,7 +38,13 @@ class _Entry:
 
 
 class PublishedRegistry:
-    def __init__(self, *, default_key: bytes | None = None, default_kid: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        default_key: bytes | None = None,
+        default_kid: str | None = None,
+        metrics: Metrics | None = None,
+    ) -> None:
         # capability_id+version -> Entry. The same capability may
         # have multiple published versions side by side.
         self._by_version: dict[tuple[str, str], _Entry] = {}
@@ -46,8 +55,37 @@ class PublishedRegistry:
         self._by_partner: dict[str, set[tuple[str, str]]] = {}
         self._default_key = default_key
         self._default_kid = default_kid
+        # M13 — the registry is the natural place to count
+        # publish / revoke events because every transition flows
+        # through this class. A SRE scrapes the same metrics
+        # whether the call came from the CLI or the API.
+        self._metrics = metrics
+        if metrics is not None:
+            self._m_published = metrics.counter(
+                "orchestra_publish_published_total",
+                "Total Agent Cards published.",
+            )
+            self._m_revoked = metrics.counter(
+                "orchestra_publish_revoked_total",
+                "Total Agent Cards revoked.",
+            )
+            self._m_published_gauge = metrics.gauge(
+                "orchestra_published_cards_total",
+                "Total published Agent Cards.",
+            )
+        else:
+            self._m_published = None
+            self._m_revoked = None
+            self._m_published_gauge = None
 
-    def publish(self, card: AgentCard, *, key: bytes | None = None, kid: str | None = None) -> AgentCard:
+    def _refresh_published_gauge(self) -> None:
+        """Re-set the published-cards gauge to the current size."""
+        if self._m_published_gauge is not None:
+            self._m_published_gauge.set(float(len(self._by_version)))
+
+    def publish(
+        self, card: AgentCard, *, key: bytes | None = None, kid: str | None = None
+    ) -> AgentCard:
         """Sign + publish a Card.
 
         A Card in DRAFT becomes PUBLISHED. A Card already PUBLISHED
@@ -74,19 +112,26 @@ class PublishedRegistry:
             raise PublishError("registry has no default key/kid; pass key= and kid=")
         # Flip state first, then sign. The signature covers the
         # as-published body (status=PUBLISHED, published_at set).
-        as_published = card.model_copy(update={
-            "status": CardStatus.PUBLISHED,
-            "published_at": card.created_at,
-        })
+        as_published = card.model_copy(
+            update={
+                "status": CardStatus.PUBLISHED,
+                "published_at": card.created_at,
+            }
+        )
         signed = sign_card(as_published, key=k, kid=k_kid)
         entry = _Entry(card=signed, key=k, kid=k_kid)
         self._by_version[(card.capability_id, card.version)] = entry
         if card.capability_id not in self._latest:
             self._latest[card.capability_id] = (card.version, card.partner_id)
         self._by_partner.setdefault(card.partner_id, set()).add((card.capability_id, card.version))
+        if self._m_published is not None:
+            self._m_published.inc()
+        self._refresh_published_gauge()
         return signed
 
-    def publish_new_version(self, card: AgentCard, *, key: bytes | None = None, kid: str | None = None) -> AgentCard:
+    def publish_new_version(
+        self, card: AgentCard, *, key: bytes | None = None, kid: str | None = None
+    ) -> AgentCard:
         """Publish a new version of an existing capability.
 
         Unlike :meth:`publish`, the previous version is NOT
@@ -137,18 +182,25 @@ class PublishedRegistry:
         if entry is None:
             raise KeyError(f"no published card for {capability_id} v{version}")
         from orchestra.core.time import utc_now_iso
-        updated = entry.card.model_copy(update={
-            "status": CardStatus.REVOKED,
-            "revoked_at": utc_now_iso(),
-            "contract_snapshot": {**entry.card.contract_snapshot, "revoke_reason": reason},
-        })
+
+        updated = entry.card.model_copy(
+            update={
+                "status": CardStatus.REVOKED,
+                "revoked_at": utc_now_iso(),
+                "contract_snapshot": {**entry.card.contract_snapshot, "revoke_reason": reason},
+            }
+        )
         entry.card = updated
         # Remove from "latest" if this was the latest version.
         latest = self._latest.get(capability_id)
         if latest and latest[0] == version:
             # If there's another published version, promote it.
             for (cid, ver), ent in self._by_version.items():
-                if cid == capability_id and ent.card.status == CardStatus.PUBLISHED and ver != version:
+                if (
+                    cid == capability_id
+                    and ent.card.status == CardStatus.PUBLISHED
+                    and ver != version
+                ):
                     self._latest[capability_id] = (ver, ent.card.partner_id)
                     break
             else:
@@ -157,6 +209,9 @@ class PublishedRegistry:
         partner_set = self._by_partner.get(entry.card.partner_id)
         if partner_set:
             partner_set.discard((capability_id, version))
+        if self._m_revoked is not None:
+            self._m_revoked.inc()
+        self._refresh_published_gauge()
         return updated
 
     def is_current(self, capability_id: str, version: str | None = None) -> bool:

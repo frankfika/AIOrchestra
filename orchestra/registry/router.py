@@ -17,7 +17,7 @@ from orchestra.core.schema import (
 )
 from orchestra.registry.eligible import EligibleSet, compute_eligible_set
 from orchestra.registry.manifest_store import ManifestStore
-from orchestra.registry.policy import PolicyEngine, PolicyRequest, PolicyDecision
+from orchestra.registry.policy import PolicyDecision, PolicyEngine, PolicyRequest
 
 
 @dataclass(frozen=True)

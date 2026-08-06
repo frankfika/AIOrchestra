@@ -20,8 +20,9 @@ silently allow.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Iterable
+from typing import Any
 
 from orchestra.core.errors import ContractViolation
 from orchestra.core.schema import (

@@ -16,7 +16,6 @@ from orchestra.core.schema import (
     DataView,
     TaskContract,
     TaskTemplate,
-    ValueRef,
 )
 
 

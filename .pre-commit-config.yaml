@@ -1,0 +1,41 @@
+# pre-commit config for AIOrchestra
+# --------------------------------
+# The dev path uses ruff for lint + format. The hooks below are
+# intentionally minimal — a hook that fires too often gets disabled
+# in practice. A SRE can run ``pre-commit run --all-files`` once on
+# the workstation; CI is gated on the same set (see .github/workflows).
+#
+# Install with:
+#   pip install pre-commit
+#   pre-commit install
+#
+# Then every ``git commit`` runs the hooks. Bypass with
+# ``git commit --no-verify`` for one-off hotfixes (rare).
+#
+# The lint pass is configured with ``--exit-zero`` so it auto-fixes
+# the easy stuff and warns on the rest, but never blocks a commit.
+# A SRE who wants to clean up the warnings can run
+# ``pre-commit run --all-files`` (it exits zero) and review the diff.
+# The format pass is the strict gate: a commit that reformats a file
+# makes the change visible in the diff so the next reviewer sees it.
+#
+# Why we don't add black / isort / mypy:
+#   * ruff is a single binary that handles lint, format, and import
+#     order — fewer moving parts, no Python toolchain fragmentation.
+#   * mypy is too noisy for the M0..M13 dev path (the ``# type: ignore``
+#     burden would outweigh the value). The production swap is a typed
+#     binding contract (see ADR-0002) — not a Python type system.
+---
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      # Linter — auto-fix what it can, warn on the rest, but never
+      # block. The remaining warnings are a backlog for a future
+      # cleanup PR; they don't fail the commit.
+      - id: ruff
+        args: [--fix, --exit-zero]
+        types_or: [python, pyi]
+      # Formatter — strict. Reformatting happens on-disk so the
+      # commit's diff shows the change.
+      - id: ruff-format

@@ -12,7 +12,7 @@ already carries ``signed_by`` and ``signature`` fields.
 """
 from __future__ import annotations
 
-from orchestra.core.hashing import hmac_keygen, hmac_sign
+from orchestra.core.hashing import hmac_sign
 from orchestra.core.schema import ExecutionPlan
 
 

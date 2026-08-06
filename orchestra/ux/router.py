@@ -12,7 +12,8 @@ Mounted at the API root by :func:`orchestra.api.app.create_app`. Exposes:
 """
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -57,7 +58,10 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         state = state_provider()
         from orchestra.core.ids import new_id
         from orchestra.core.schema import (
-            DataClassification, SecurityLabel, SourceTrust, TaskRunState,
+            DataClassification,
+            SecurityLabel,
+            SourceTrust,
+            TaskRunState,
         )
 
         task_run_id = new_id()

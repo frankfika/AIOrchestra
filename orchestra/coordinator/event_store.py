@@ -21,15 +21,15 @@ explicitly (no silent SQLite fallback — that would be a hidden swap).
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Any
 
 import psycopg
 from psycopg.rows import dict_row
 
 from orchestra.core.errors import OrchestraError
-from orchestra.core.schema import AuditEvent, SignedReceipt, TaskRunState, NodeRunState
-
+from orchestra.core.schema import AuditEvent, NodeRunState, SignedReceipt, TaskRunState
 
 DEFAULT_DSN = "postgresql://orchestra:orchestra@127.0.0.1:5432/orchestra"
 
@@ -118,7 +118,7 @@ class EventStoreUnavailable(OrchestraError):
 class EventStore:
     def __init__(self, dsn: str | None = None) -> None:
         self._dsn = dsn or os.environ.get("DATABASE_URL", DEFAULT_DSN)
-        self._conn: Optional[psycopg.Connection] = None
+        self._conn: psycopg.Connection | None = None
 
     def connect(self) -> None:
         try:

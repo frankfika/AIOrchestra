@@ -19,9 +19,8 @@ mirrors the operator's configured target.
 from __future__ import annotations
 
 import math
-import statistics
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import Iterable
 
 
 @dataclass

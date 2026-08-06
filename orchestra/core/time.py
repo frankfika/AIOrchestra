@@ -7,12 +7,12 @@ anywhere in the system.
 from __future__ import annotations
 
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 
 def utc_now_iso() -> str:
     """Return current UTC time as ISO-8601 with ``Z`` suffix."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def parse_utc_iso(s: str) -> datetime:

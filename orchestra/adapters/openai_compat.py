@@ -9,7 +9,6 @@ public OpenAI-compatible endpoint is a single string change.
 from __future__ import annotations
 
 import json
-from typing import Any
 
 import httpx
 

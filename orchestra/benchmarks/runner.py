@@ -16,11 +16,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
-from data.samples.contracts import SAMPLE_CONTRACTS, get_contract
-from orchestra.benchmarks.manifest import DEFAULT_P0_MANIFEST, BenchmarkManifest, manifest_id
+from data.samples.contracts import SAMPLE_CONTRACTS
+from orchestra.benchmarks.manifest import DEFAULT_P0_MANIFEST, manifest_id
 from orchestra.coordinator.engine import Coordinator, build_default_coordinator
 from orchestra.coordinator.event_store import EventStore
 from orchestra.core.hashing import hmac_keygen
@@ -30,7 +31,6 @@ from orchestra.core.schema import (
     SecurityLabel,
     SourceTrust,
 )
-
 
 # Per-contract ground truth for the P0 metrics. The fields here are
 # what each baseline *could* produce. The all-public baseline cannot
@@ -123,8 +123,8 @@ def build_all_local_runner(
         # Extract
         local = coordinator._adapters["local.contract-extractor"]
         # Build a fake grant + view for the call.
-        from orchestra.core.schema import DataView, Purpose
         from orchestra.coordinator.node_grant import NodeGrantIssuer
+        from orchestra.core.schema import DataView, Purpose
 
         # Local extract
         text = inputs["contract_text"]
@@ -177,9 +177,9 @@ def build_all_public_runner(
 
     async def run(contract_id: str, inputs: dict[str, Any]) -> dict[str, Any]:
         from orchestra.adapters.base import AdapterRequest
-        from orchestra.core.schema import DataView, Purpose
         from orchestra.coordinator.node_grant import NodeGrantIssuer
         from orchestra.core.ids import new_id
+        from orchestra.core.schema import DataView, Purpose
 
         view = DataView(name="public.query", shape="fields", fields=["vendor_id", "vendor_name"])
         issuer = NodeGrantIssuer(hmac_keygen(), ttl_seconds=600)

@@ -25,18 +25,14 @@ unknown label is a deny with a :class:`CompileError`.
 """
 from __future__ import annotations
 
-from typing import Iterable
-
 from orchestra.compiler.errors import CompileError, CompileErrorKind
 from orchestra.compiler.normalizer import NormalizedGraph
 from orchestra.core.schema import (
     CapabilityManifest,
     DataClassification,
-    JoinSemantics,
     SecurityLabel,
     SourceTrust,
 )
-
 
 # Numeric order for classification (must match SEC-001 §1)
 _CLASS_ORDER = {

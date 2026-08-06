@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -38,10 +38,10 @@ from orchestra.integrations.delegation import (
 class AgenticHubResult:
     task_run_id: str
     state: str
-    plan_id: Optional[str]
+    plan_id: str | None
     audit_url: str
     route_url: str
-    error: Optional[str]
+    error: str | None
     delegation: dict[str, Any] = field(default_factory=dict)
     attempt: int = 0
     duration_ms: int = 0

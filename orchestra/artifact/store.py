@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from orchestra.core.errors import OrchestraError
 from orchestra.core.ids import digest_json, new_id

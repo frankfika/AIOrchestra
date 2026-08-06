@@ -10,6 +10,6 @@ Adapter reads them with the Node Grant as authorisation. The
 Artifact Manager enforces the *Zone* boundary: a Cell can
 only read Artifacts in its own Cell.
 """
-from orchestra.artifact.store import ArtifactStore, Artifact
+from orchestra.artifact.store import Artifact, ArtifactStore
 
 __all__ = ["ArtifactStore", "Artifact"]

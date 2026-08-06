@@ -18,20 +18,15 @@ HSM) without changing the interface.
 from __future__ import annotations
 
 import hashlib
-import os
 import re
 import subprocess
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
-import yaml
-
-from orchestra.core.hashing import hmac_keygen, hmac_sign, hmac_verify
+from orchestra.core.hashing import hmac_sign, hmac_verify
 from orchestra.core.ids import new_id
 from orchestra.core.time import utc_now_iso
-
 
 # ---------------------------------------------------------------------------
 # SBOM
@@ -234,8 +229,8 @@ class Provenance:
     build_finished_at: str
     materials: list[dict[str, Any]] = field(default_factory=list)
     artifacts: list[dict[str, Any]] = field(default_factory=list)
-    signature: Optional[str] = None
-    kid: Optional[str] = None
+    signature: str | None = None
+    kid: str | None = None
 
     def to_signable(self) -> dict[str, Any]:
         """The body that the signature covers. Excludes the
@@ -273,7 +268,6 @@ def build_provenance(
     The signature is HMAC over the to_dict body so a verifier does
     not need to re-derive the build environment.
     """
-    import time as _time
     p = Provenance(
         build_id=f"build:{new_id()[:12]}",
         source_uri=source_uri,

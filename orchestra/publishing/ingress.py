@@ -13,15 +13,19 @@ signed bearer tokens (mirroring the M2 Credential Broker shape).
 M6 will swap the verifier for an OIDC / SPIFFE-aware one without
 changing the interface.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from orchestra.core.errors import OrchestraError
 from orchestra.core.hashing import hmac_sign, hmac_verify
 from orchestra.publishing.card import AgentCard, CardStatus
 from orchestra.publishing.registry import PublishedRegistry
+
+if TYPE_CHECKING:  # pragma: no cover
+    from orchestra.observability.metrics import Metrics
 
 
 class IngressDenied(OrchestraError):
@@ -44,10 +48,10 @@ class BearerToken:
     scopes: list[str]
     # Optional expiration in Unix seconds. M5 does not enforce;
     # M6 will swap in a real clock check.
-    expires_at: Optional[int] = None
+    expires_at: int | None = None
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "BearerToken":
+    def from_dict(cls, d: dict[str, Any]) -> BearerToken:
         scopes = d.get("scope") or d.get("scopes") or []
         if isinstance(scopes, str):
             scopes = scopes.split()
@@ -71,9 +75,26 @@ class Ingress:
     key; the dev demo uses the default key.
     """
 
-    def __init__(self, registry: PublishedRegistry, *, token_key: bytes) -> None:
+    def __init__(
+        self,
+        registry: PublishedRegistry,
+        *,
+        token_key: bytes,
+        metrics: Metrics | None = None,
+    ) -> None:
         self._registry = registry
         self._token_key = token_key
+        # M13 — every admit call records an outcome so a SRE can
+        # see admit / reject pressure in the dashboard.
+        self._metrics = metrics
+        if metrics is not None:
+            self._m_admit = metrics.counter(
+                "orchestra_ingress_admit_total",
+                "Total Ingress.admit calls.",
+                labels=("outcome",),
+            )
+        else:
+            self._m_admit = None
 
     def issue_token(
         self,
@@ -82,7 +103,7 @@ class Ingress:
         subject: str,
         audience: str,
         scopes: list[str],
-        expires_at: Optional[int] = None,
+        expires_at: int | None = None,
     ) -> str:
         """Helper for tests and dev demos: mint a token signed with
         ``token_key``. M5 keeps the verifier + signer symmetric; M6
@@ -96,13 +117,17 @@ class Ingress:
         if expires_at is not None:
             body["exp"] = expires_at
         import json
+
         payload = json.dumps(body, sort_keys=True, ensure_ascii=False)
         sig = hmac_sign(self._token_key, payload)  # str
         import base64
+
         return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii") + "." + sig
 
     def verify_token(self, token: str) -> BearerToken:
-        import base64, json as _json
+        import base64
+        import json as _json
+
         try:
             payload_b64, sig = token.rsplit(".", 1)
         except ValueError as e:
@@ -143,13 +168,20 @@ class Ingress:
         try:
             card = self._registry.get(capability_id, version=version)
         except KeyError:
+            self._record_admit("not_found")
             raise IngressDenied(f"no published card for {capability_id} v{version}")
         if card.status != CardStatus.PUBLISHED:
+            self._record_admit("not_published")
             raise IngressDenied(f"card {card.card_id} is {card.status.value}, not published")
         # 2. Token verification.
-        bt = self.verify_token(token)
+        try:
+            bt = self.verify_token(token)
+        except IngressDenied:
+            self._record_admit("bad_token")
+            raise
         # 3. Audience check.
         if bt.audience not in card.audiences:
+            self._record_admit("audience_mismatch")
             raise IngressDenied(
                 f"token audience {bt.audience!r} not in card audiences {card.audiences!r}"
             )
@@ -157,5 +189,11 @@ class Ingress:
         for spec in card.contract_snapshot.get("audiences", []) or []:
             for scope in spec.get("required_scopes", []):
                 if not bt.has_scope(scope):
+                    self._record_admit("missing_scope")
                     raise IngressDenied(f"token missing required scope {scope!r}")
+        self._record_admit("admitted")
         return card, bt
+
+    def _record_admit(self, outcome: str) -> None:
+        if self._m_admit is not None:
+            self._m_admit.inc(outcome=outcome)

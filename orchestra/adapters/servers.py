@@ -12,9 +12,7 @@ public sources; the mock sink keeps an in-memory log keyed by record id.
 """
 from __future__ import annotations
 
-import asyncio
 import json
-import os
 import socket
 import threading
 import time
@@ -26,7 +24,6 @@ from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from orchestra.adapters.local_model import extract_facts_locally
-
 
 # ---------------------------------------------------------------------------
 # Local Model server (deterministic extractor)

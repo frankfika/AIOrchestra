@@ -6,7 +6,7 @@ between an on-disk file and what tests expect.
 """
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from orchestra.core.schema import (
     CapabilityKind,
@@ -192,8 +192,8 @@ def load_default_field_manifests() -> dict[tuple[str, str], FieldManifest]:
 
 
 def make_egress_manifest_lookup(
-    overrides: Optional[dict[tuple[str, str], FieldManifest]] = None,
-) -> Callable[[str, str], Optional[FieldManifest]]:
+    overrides: dict[tuple[str, str], FieldManifest] | None = None,
+) -> Callable[[str, str], FieldManifest | None]:
     """Build a ``(capability_id, view_name) -> FieldManifest`` lookup.
 
     The base table is :func:`load_default_field_manifests`; ``overrides``
@@ -203,7 +203,7 @@ def make_egress_manifest_lookup(
     if overrides:
         base.update(overrides)
 
-    def _lookup(capability_id: str, view_name: str) -> Optional[FieldManifest]:
+    def _lookup(capability_id: str, view_name: str) -> FieldManifest | None:
         return base.get((capability_id, view_name))
 
     return _lookup

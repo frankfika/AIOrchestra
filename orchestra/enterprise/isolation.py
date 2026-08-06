@@ -21,19 +21,17 @@ modification. New code MUST go through the multi-tenant path.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator, Optional
+from typing import Any
 
 import psycopg
 
-from orchestra.coordinator.event_store import EventStore
 from orchestra.core.schema import AuditEvent, TaskRunState
 from orchestra.enterprise.tenant import (
-    TenantContext,
     TenantRole,
     get_active,
 )
-
 
 DEFAULT_DSN = "postgresql://orchestra:orchestra@127.0.0.1:5432/orchestra"
 LEGACY_TENANT = "tenant:demo"
@@ -95,7 +93,7 @@ class IsolatingEventStore:
 
     def __init__(self, dsn: str | None = None) -> None:
         self._dsn = dsn or os.environ.get("DATABASE_URL", DEFAULT_DSN)
-        self._conn: Optional[psycopg.Connection] = None
+        self._conn: psycopg.Connection | None = None
 
     def connect(self) -> None:
         self._conn = psycopg.connect(self._dsn, autocommit=False)
@@ -125,13 +123,12 @@ class IsolatingEventStore:
 
     def create_tenant(self, tenant_id: str, name: str, *, plan: str = "default") -> None:
         """Create a tenants row. Idempotent on re-run (safe migration)."""
-        with self._tx() as conn:
-            with conn.cursor() as cur:
-                # The CREATE TABLE and INSERT are split because
-                # psycopg's prepared statements reject multi-command
-                # SQL strings.
-                cur.execute(
-                    """
+        with self._tx() as conn, conn.cursor() as cur:
+            # The CREATE TABLE and INSERT are split because
+            # psycopg's prepared statements reject multi-command
+            # SQL strings.
+            cur.execute(
+                """
                     CREATE TABLE IF NOT EXISTS tenants (
                         tenant_id TEXT PRIMARY KEY,
                         name TEXT NOT NULL,
@@ -140,19 +137,18 @@ class IsolatingEventStore:
                         status TEXT NOT NULL DEFAULT 'active'
                     )
                     """
-                )
-                cur.execute(
-                    "INSERT INTO tenants (tenant_id, name, plan) VALUES (%s, %s, %s) "
-                    "ON CONFLICT (tenant_id) DO NOTHING",
-                    (tenant_id, name, plan),
-                )
+            )
+            cur.execute(
+                "INSERT INTO tenants (tenant_id, name, plan) VALUES (%s, %s, %s) "
+                "ON CONFLICT (tenant_id) DO NOTHING",
+                (tenant_id, name, plan),
+            )
 
     def list_tenants(self) -> list[dict[str, Any]]:
-        with self._tx() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT tenant_id, name, plan, status FROM tenants ORDER BY tenant_id")
-                cols = ("tenant_id", "name", "plan", "status")
-                return [dict(zip(cols, row)) for row in cur.fetchall()]
+        with self._tx() as conn, conn.cursor() as cur:
+            cur.execute("SELECT tenant_id, name, plan, status FROM tenants ORDER BY tenant_id")
+            cols = ("tenant_id", "name", "plan", "status")
+            return [dict(zip(cols, row)) for row in cur.fetchall()]
 
     # ------------------------------------------------------------------
     # Task runs
@@ -216,29 +212,28 @@ class IsolatingEventStore:
 
     def append_event(self, ev: AuditEvent) -> None:
         ctx = get_active()
-        with self._tx() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
+        with self._tx() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
                     INSERT INTO events (
                         event_id, tenant_id, task_run_id, node_run_id, seq, kind,
                         occurred_at, actor, payload, prev_event_id
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                     """,
-                    (
-                        ev.event_id,
-                        ctx.tenant.tenant_id,
-                        ev.task_run_id,
-                        ev.node_run_id,
-                        ev.seq,
-                        ev.kind.value,
-                        ev.occurred_at,
-                        ev.actor,
-                        _json_dumps(ev.payload),
-                        ev.prev_event_id,
-                    ),
-                )
+                (
+                    ev.event_id,
+                    ctx.tenant.tenant_id,
+                    ev.task_run_id,
+                    ev.node_run_id,
+                    ev.seq,
+                    ev.kind.value,
+                    ev.occurred_at,
+                    ev.actor,
+                    _json_dumps(ev.payload),
+                    ev.prev_event_id,
+                ),
+            )
 
     def list_events(self, task_run_id: str) -> list[dict[str, Any]]:
         ctx = get_active()
@@ -264,12 +259,11 @@ class IsolatingEventStore:
         """
         ctx = get_active()
         ctx.require_role(TenantRole.ADMIN)
-        with self._tx() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT tenant_id, count(*) FROM task_runs GROUP BY tenant_id ORDER BY tenant_id"
-                )
-                return [{"tenant_id": t, "task_count": c} for t, c in cur.fetchall()]
+        with self._tx() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT tenant_id, count(*) FROM task_runs GROUP BY tenant_id ORDER BY tenant_id"
+            )
+            return [{"tenant_id": t, "task_count": c} for t, c in cur.fetchall()]
 
 
 def _json_dumps(payload: dict[str, Any]) -> str:

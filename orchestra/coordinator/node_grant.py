@@ -26,7 +26,6 @@ from orchestra.core.schema import (
 )
 from orchestra.core.time import parse_utc_iso, utc_now_iso
 
-
 DEFAULT_TTL_SECONDS = 600  # 10 minutes — P0 dev credential
 
 

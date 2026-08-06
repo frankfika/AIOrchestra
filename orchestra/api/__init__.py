@@ -17,6 +17,6 @@ Endpoints:
 The app is a *thin* layer over the Coordinator. The Coordinator is the
 source of truth; the API just translates HTTP ↔ Python.
 """
-from orchestra.api.app import create_app, AppState, run_server
+from orchestra.api.app import AppState, create_app, run_server
 
 __all__ = ["create_app", "AppState", "run_server"]

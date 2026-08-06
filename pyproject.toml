@@ -10,14 +10,14 @@ readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi==0.115.0",
-    "uvicorn[standard]==0.30.6",
-    "pydantic==2.12.5",
-    "httpx==0.28.1",
-    "PyYAML==6.0.3",
-    "cryptography==46.0.5",
-    "psycopg[binary]==3.2.10",
-    "python-multipart==0.0.12",
+    "fastapi>=0.116.0",
+    "uvicorn[standard]>=0.30.6",
+    "pydantic>=2.12.5",
+    "httpx>=0.28.1",
+    "PyYAML>=6.0.3",
+    "cryptography>=46.0.5",
+    "psycopg[binary]>=3.2.10",
+    "python-multipart>=0.0.12",
 ]
 
 [project.scripts]
@@ -25,9 +25,10 @@ orchestra = "orchestra.cli:main"
 
 [project.optional-dependencies]
 dev = [
-    "pytest==8.3.3",
-    "pytest-asyncio==0.24.0",
-    "pytest-cov==7.1.0",
+    "pytest>=9.0.3",
+    "pytest-asyncio>=0.24.0",
+    "pytest-cov>=7.1.0",
+    "ruff>=0.6.9",
 ]
 
 [tool.setuptools.packages.find]
@@ -42,3 +43,55 @@ markers = [
     "e2e: end-to-end tests requiring a running PG",
     "smoke: lightweight smoke tests",
 ]
+
+# ---------------------------------------------------------------------------
+# Ruff — the dev-path linter. The dev path is the M0..M13 surface
+# (orchestra/) plus the CLI; tests are linted too because a lint
+# regression in a test file is still a regression. The CLI entry point
+# is the only ``print``-tolerant file (SRE-friendly output).
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+# The same exclude list as pytest, plus ``.archive/`` which is
+# retired dead code from before the M8 cleanup (kept on disk for
+# archaeology, never linted).
+extend-exclude = [
+    "build", "dist", ".venv", "output", "tmp",
+    ".archive", "data",
+]
+
+[tool.ruff.lint]
+# A small, opinionated set: pycodestyle (E/W), pyflakes (F), the
+# standard security check (S), and the bugbear (B) for common bugs.
+# The dev path is Python 3.11+ so UP (pyupgrade) is also enabled.
+# The full set is intentionally narrow — adding more rules later
+# is easy, removing a flood of false-positives later is hard.
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort (import order)
+    "B",   # bugbear (common bugs)
+    "UP",  # pyupgrade (modern syntax)
+    "SIM", # simplify (e.g. ``x == None`` -> ``x is None``)
+]
+ignore = [
+    "E501",  # line length is enforced by the formatter, not the linter
+    # B008 is a false positive in FastAPI: ``Query()`` / ``Path()`` /
+    # ``Header()`` are *used* in the function signature, not just
+    # imported; the linter sees the import as "function call in default".
+    "B008",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests are allowed to use ``assert`` (it's the test API), and they
+# can re-import the same module under multiple aliases.
+"tests/**" = ["B011"]
+# The CLI is the operator entry point — short, friendly output is
+# the point. We relax the docstring rule for it.
+"orchestra/cli.py" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["orchestra"]
+combine-as-imports = true

@@ -19,13 +19,12 @@ The dev plan §0.1.2 row "Retry":
 """
 from __future__ import annotations
 
-import json
-import time
 import uuid
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
-from orchestra.core.schema import AuditEvent, EventKind
+from orchestra.core.schema import AuditEvent
 from orchestra.core.time import utc_now_iso
 
 
@@ -35,7 +34,7 @@ class OutboxEntry:
     event: AuditEvent
     enqueued_at: str
     attempts: int = 0
-    last_error: Optional[str] = None
+    last_error: str | None = None
     delivered: bool = False
 
 

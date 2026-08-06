@@ -21,9 +21,9 @@ M5 is single-partner and isolated by design. Multi-tenant open
 publishing is M6 territory.
 """
 from orchestra.publishing.card import AgentCard, sign_card, verify_card
-from orchestra.publishing.contract import PartnerContract, AudienceSpec
-from orchestra.publishing.registry import PublishedRegistry
+from orchestra.publishing.contract import AudienceSpec, PartnerContract
 from orchestra.publishing.kill_switch import KillSwitch
+from orchestra.publishing.registry import PublishedRegistry
 from orchestra.publishing.release_gate import ReleaseGate
 
 __all__ = [

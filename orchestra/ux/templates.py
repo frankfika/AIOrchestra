@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import html
 import json
-from typing import Any, Iterable
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # Shared stylesheet (inline, single-file friendly)

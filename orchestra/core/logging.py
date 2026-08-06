@@ -28,7 +28,7 @@ import sys
 import time
 import uuid
 from contextvars import ContextVar
-from typing import Any, Callable
+from typing import Any
 
 # The active request id is propagated through a contextvar so
 # log records emitted from any layer (Coordinator, Egress PEP,

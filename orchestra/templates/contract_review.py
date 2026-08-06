@@ -31,14 +31,13 @@ from orchestra.core.schema import (
     EdgeSpec,
     Effect,
     EffectKind,
+    ExecutionPlan,
     NodeSpec,
     PlanEdge,
     PlanNode,
-    ExecutionPlan,
     Purpose,
     TaskTemplate,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared purpose

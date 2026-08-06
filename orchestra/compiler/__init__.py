@@ -19,18 +19,18 @@ already bound); M1 enforces them at *compile* time, before any
 Capability is bound, so the rejection is cheaper and the audit
 trail is clean.
 """
-from orchestra.compiler.errors import CompileError, CompileErrorKind
-from orchestra.compiler.parser import Parser
-from orchestra.compiler.normalizer import Normalizer
-from orchestra.compiler.type_checker import TypeChecker
-from orchestra.compiler.info_flow import InformationFlowChecker
-from orchestra.compiler.effect_checker import EffectChecker
-from orchestra.compiler.delegation_checker import DelegationChecker
-from orchestra.compiler.counter_example import render_counter_example
-from orchestra.compiler.trust_compiler import TrustCompiler, CompileResult
-from orchestra.compiler.resolver import Resolver, ResolverResult
 from orchestra.compiler.binding_closure import BindingClosureChecker, ClosureResult
+from orchestra.compiler.counter_example import render_counter_example
+from orchestra.compiler.delegation_checker import DelegationChecker
+from orchestra.compiler.effect_checker import EffectChecker
+from orchestra.compiler.errors import CompileError, CompileErrorKind
+from orchestra.compiler.info_flow import InformationFlowChecker
+from orchestra.compiler.normalizer import Normalizer
+from orchestra.compiler.parser import Parser
 from orchestra.compiler.plan_signer import PlanSigner
+from orchestra.compiler.resolver import Resolver, ResolverResult
+from orchestra.compiler.trust_compiler import CompileResult, TrustCompiler
+from orchestra.compiler.type_checker import TypeChecker
 
 __all__ = [
     "CompileError",

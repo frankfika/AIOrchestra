@@ -19,7 +19,6 @@ import sys
 from typing import Any
 
 from orchestra.core.hashing import verify_cose_like
-from orchestra.core.ids import digest_json
 from orchestra.core.schema import SignedReceipt
 
 

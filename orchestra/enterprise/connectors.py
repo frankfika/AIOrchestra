@@ -17,14 +17,12 @@ from __future__ import annotations
 
 import abc
 import json
-import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from orchestra.core.hashing import hmac_keygen, hmac_sign, hmac_verify
 from orchestra.core.ids import new_id
 from orchestra.core.time import utc_now_iso
-
 
 # ---------------------------------------------------------------------------
 # OIDC
@@ -59,7 +57,7 @@ class DevHMACIdP:
     audience: str
     key: bytes
 
-    def mint(self, subject: str, scopes: list[str], *, expires_at: Optional[int] = None) -> str:
+    def mint(self, subject: str, scopes: list[str], *, expires_at: int | None = None) -> str:
         import base64
         body = {"iss": self.issuer, "sub": subject, "aud": self.audience, "scope": " ".join(scopes)}
         if expires_at is not None:
@@ -105,7 +103,7 @@ class SCIMDirectory(abc.ABC):
     def upsert_user(self, user: SCIMUser) -> None: ...
 
     @abc.abstractmethod
-    def get_user(self, user_id: str) -> Optional[SCIMUser]: ...
+    def get_user(self, user_id: str) -> SCIMUser | None: ...
 
     @abc.abstractmethod
     def list_users(self) -> list[SCIMUser]: ...
@@ -121,7 +119,7 @@ class InMemorySCIMDirectory(SCIMDirectory):
     def upsert_user(self, user: SCIMUser) -> None:
         self._users[user.user_id] = user
 
-    def get_user(self, user_id: str) -> Optional[SCIMUser]:
+    def get_user(self, user_id: str) -> SCIMUser | None:
         return self._users.get(user_id)
 
     def list_users(self) -> list[SCIMUser]:
@@ -149,7 +147,7 @@ class KMSKey:
     algorithm: str
     material: bytes
     created_at: str = field(default_factory=utc_now_iso)
-    rotated_to: Optional[str] = None
+    rotated_to: str | None = None
     revoked: bool = False
 
 
@@ -164,7 +162,7 @@ class KMSKeyProvider(abc.ABC):
     def create_key(self, algorithm: str = "HS256") -> KMSKey: ...
 
     @abc.abstractmethod
-    def get_key(self, kid: str) -> Optional[KMSKey]: ...
+    def get_key(self, kid: str) -> KMSKey | None: ...
 
     @abc.abstractmethod
     def rotate(self, old_kid: str) -> KMSKey: ...
@@ -183,7 +181,7 @@ class InMemoryKMSKeyProvider(KMSKeyProvider):
         self._keys[kid] = key
         return key
 
-    def get_key(self, kid: str) -> Optional[KMSKey]:
+    def get_key(self, kid: str) -> KMSKey | None:
         k = self._keys.get(kid)
         if k is None or k.revoked:
             return None

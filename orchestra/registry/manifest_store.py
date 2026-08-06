@@ -6,7 +6,7 @@ P0, every manifest loaded is the live one.
 """
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 from orchestra.core.errors import ContractViolation
 from orchestra.core.schema import CapabilityManifest

@@ -15,10 +15,10 @@ If OPA is unreachable, the call raises :class:`OPAUnavailable`;
 the Caller is expected to **fail-closed** (invariant #8).
 """
 from orchestra.opa.interface import (
-    PolicyDecisionPoint,
-    OPAUnavailable,
-    OpaHttpClient,
     InProcessPDP,
+    OpaHttpClient,
+    OPAUnavailable,
+    PolicyDecisionPoint,
 )
 from orchestra.opa.types import OpaConfig, OpaDecision
 

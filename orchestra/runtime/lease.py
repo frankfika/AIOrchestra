@@ -22,9 +22,8 @@ the *authorisation* (what the Worker may do); the Lease is the
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 
 class LeaseState(str, Enum):
@@ -61,8 +60,8 @@ class Lease:
     fencing_token: FencingToken
     state: LeaseState = LeaseState.PENDING
     issued_at: str = ""
-    claimed_at: Optional[str] = None
+    claimed_at: str | None = None
     expires_at: str = ""
-    worker_id: Optional[str] = None
+    worker_id: str | None = None
     heartbeat_count: int = 0
-    revoked_reason: Optional[str] = None
+    revoked_reason: str | None = None

@@ -19,13 +19,17 @@ plus its citation manifest. M5 is in-process; M6 will swap the
 manifest store for the Postgres-backed one without changing the
 interface.
 """
+
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any
 
 from orchestra.core.errors import OrchestraError
-from orchestra.core.schema import Citation, CitationManifest, CitationSourceRef
+from orchestra.core.schema import CitationManifest
 from orchestra.publishing.card import AgentCard
+
+if TYPE_CHECKING:  # pragma: no cover
+    from orchestra.observability.metrics import Metrics
 
 
 class ReleaseDenied(OrchestraError):
@@ -34,10 +38,18 @@ class ReleaseDenied(OrchestraError):
 
 # The four forbidden top-level keys. A partner that gets a result
 # with any of these in it can reverse-engineer internal state.
-_FORBIDDEN_KEYS = frozenset({
-    "error", "errors", "trace", "traces", "stacktrace", "stack",
-    "internal_id", "raw_payload",
-})
+_FORBIDDEN_KEYS = frozenset(
+    {
+        "error",
+        "errors",
+        "trace",
+        "traces",
+        "stacktrace",
+        "stack",
+        "internal_id",
+        "raw_payload",
+    }
+)
 
 
 class ReleaseGate:
@@ -48,9 +60,27 @@ class ReleaseGate:
     would leak a higher-tier label than the Card's audience allows.
     """
 
-    def __init__(self, *, card: AgentCard, max_unsourced_claims: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        card: AgentCard,
+        max_unsourced_claims: int = 0,
+        metrics: Metrics | None = None,
+    ) -> None:
         self._card = card
         self._max_unsourced = max_unsourced_claims
+        # M13 — when metrics is set, every denial increments the
+        # ``orchestra_release_gate_denied_total{reason=...}`` counter
+        # so a SRE can see gate pressure in Grafana.
+        self._metrics = metrics
+        if metrics is not None:
+            self._m_denied = metrics.counter(
+                "orchestra_release_gate_denied_total",
+                "Total ReleaseGate denials.",
+                labels=("reason",),
+            )
+        else:
+            self._m_denied = None
 
     @property
     def card(self) -> AgentCard:
@@ -67,25 +97,27 @@ class ReleaseGate:
         # 1. Structure check: result must be a dict with a
         #    ``claims`` list. Free-text is not a release.
         if not isinstance(result, dict):
-            raise ReleaseDenied("result must be a dict, not free text")
+            self._deny("not_a_dict", "result must be a dict, not free text")
         claims = result.get("claims")
         if not isinstance(claims, list):
-            raise ReleaseDenied("result.claims must be a list (structured release only)")
+            self._deny("no_claims_list", "result.claims must be a list (structured release only)")
         # 2. Forbidden keys.
-        for k in result.keys():
+        for k in result:
             if k.lower() in _FORBIDDEN_KEYS:
-                raise ReleaseDenied(f"forbidden key in release: {k!r}")
+                self._deny("forbidden_key", f"forbidden key in release: {k!r}")
         # 3. Citation count must match claim count.
         if len(manifest.citations) != len(claims):
-            raise ReleaseDenied(
-                f"citation count {len(manifest.citations)} != claim count {len(claims)}"
+            self._deny(
+                "citation_count_mismatch",
+                f"citation count {len(manifest.citations)} != claim count {len(claims)}",
             )
         # 4. Every claim has at least one citation; no
         #    unsourced claims past the budget.
         unsourced = sum(1 for c in manifest.citations if not c.sources)
         if unsourced > self._max_unsourced:
-            raise ReleaseDenied(
-                f"{unsourced} unsourced claims > budget {self._max_unsourced}"
+            self._deny(
+                "unsourced_over_budget",
+                f"{unsourced} unsourced claims > budget {self._max_unsourced}",
             )
         # 5. No restricted sources cross the gate.
         for c in manifest.citations:
@@ -96,15 +128,28 @@ class ReleaseGate:
                 cls = getattr(src.label, "classification", None)
                 # DataClassification is an Enum; compare to .value.
                 if cls is not None and getattr(cls, "value", str(cls)) == "restricted":
-                    raise ReleaseDenied(
-                        f"citation {c.citation_id} carries restricted source {src.ref!r}"
+                    self._deny(
+                        "restricted_source",
+                        f"citation {c.citation_id} carries restricted source {src.ref!r}",
                     )
         # 6. Audience check: every citation's ``audience`` must be
         #    in the Card's audiences.
         for c in manifest.citations:
             if c.audience not in self._card.audiences:
-                raise ReleaseDenied(
+                self._deny(
+                    "audience_mismatch",
                     f"citation {c.citation_id} audience {c.audience!r} "
-                    f"not in card audiences {self._card.audiences!r}"
+                    f"not in card audiences {self._card.audiences!r}",
                 )
         return result
+
+    def _deny(self, reason: str, message: str) -> None:
+        """Record the denial in metrics (if available) and raise.
+
+        The ``reason`` label is a coarse bucket (so cardinality stays
+        small); the full ``message`` is the precise text SREs see in
+        the traceback.
+        """
+        if self._m_denied is not None:
+            self._m_denied.inc(reason=reason)
+        raise ReleaseDenied(message)

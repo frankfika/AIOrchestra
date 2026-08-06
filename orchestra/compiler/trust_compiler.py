@@ -20,8 +20,8 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from orchestra.compiler.delegation_checker import DelegationChecker
-from orchestra.compiler.errors import CompileError
 from orchestra.compiler.effect_checker import EffectChecker
+from orchestra.compiler.errors import CompileError
 from orchestra.compiler.info_flow import InformationFlowChecker
 from orchestra.compiler.normalizer import Normalizer
 from orchestra.compiler.parser import Parser

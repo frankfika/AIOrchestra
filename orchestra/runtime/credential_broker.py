@@ -25,14 +25,12 @@ with a Postgres table (``CREATE TABLE credentials (...)``).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import timedelta
 from typing import Any
 
+from orchestra.coordinator.node_grant import NodeGrantIssuer
 from orchestra.core.hashing import hmac_keygen
-from orchestra.core.ids import new_id
 from orchestra.core.schema import DataView, NodeGrant, Purpose
 from orchestra.core.time import utc_now_iso
-from orchestra.coordinator.node_grant import NodeGrantIssuer
 
 
 @dataclass

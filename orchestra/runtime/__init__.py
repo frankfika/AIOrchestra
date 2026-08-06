@@ -18,13 +18,13 @@ Token, no Outbox, no Reconciler, and no Merkle log. M2 adds:
   - :class:`verify_receipt_offline` CLI (EVD-002) that re-verifies
     a signed Receipt without DB access
 """
-from orchestra.runtime.lease import Lease, LeaseState, FencingToken
+from orchestra.evidence.merkle import MerkleLog, MerkleProof
+from orchestra.runtime.credential_broker import CredentialBroker
 from orchestra.runtime.fencing import FencingGuard, StaleFencingToken
+from orchestra.runtime.lease import FencingToken, Lease, LeaseState
 from orchestra.runtime.outbox import Outbox, OutboxEntry
 from orchestra.runtime.reconciler import Reconciler, ReconcilerReport
-from orchestra.runtime.credential_broker import CredentialBroker
-from orchestra.runtime.state_machine import TaskRunStateMachine, NodeRunStateMachine
-from orchestra.evidence.merkle import MerkleLog, MerkleProof
+from orchestra.runtime.state_machine import NodeRunStateMachine, TaskRunStateMachine
 
 __all__ = [
     "Lease",

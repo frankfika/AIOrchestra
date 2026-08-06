@@ -17,8 +17,8 @@ AgenticHub, custom HTTP callers). The contract is:
     strongly Orchestra governs the call.
 """
 from orchestra.integrations.delegation import (
-    DelegationMode,
     DelegationContract,
+    DelegationMode,
     IntegrationLevel,
 )
 

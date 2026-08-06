@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
@@ -48,10 +48,10 @@ from orchestra.integrations.delegation import (
 class DifyTaskToolResult:
     task_run_id: str
     state: str
-    plan_id: Optional[str]
+    plan_id: str | None
     audit_url: str
     route_url: str
-    error: Optional[str]
+    error: str | None
     delegation: dict[str, Any] = field(default_factory=dict)
     # M4 — track how many retries the host has attempted. The
     # contract tells the host whether to retry (delegate-task) or to

@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import timedelta
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
 from orchestra.adapters.base import Adapter, AdapterRequest
 from orchestra.coordinator.event_store import EventStore
@@ -43,16 +43,13 @@ from orchestra.core.schema import (
     DataView,
     EventKind,
     ExecutionPlan,
-    NodeGrant,
     NodeRunState,
     PlanNode,
     RoutingDecision,
     SecurityLabel,
     TaskRunState,
 )
-from orchestra.core.time import parse_utc_iso, utc_now_iso
-from orchestra.registry.bootstrap import load_default_manifests
-from orchestra.registry.manifest_store import ManifestStore
+from orchestra.core.time import utc_now_iso
 from orchestra.registry.policy import PolicyEngine, default_p0_rules
 from orchestra.registry.router import Router
 from orchestra.templates.contract_review import (
@@ -61,7 +58,6 @@ from orchestra.templates.contract_review import (
     get_default_purpose,
 )
 from orchestra.xfr.egress_pep import EgressDenied, EgressPEP
-
 
 ApprovalHandler = Callable[[str, str, dict[str, Any]], Awaitable[dict[str, Any]]]
 """Callable invoked when the Coordinator needs a human decision.
@@ -92,7 +88,7 @@ class Coordinator:
         grant_issuer: NodeGrantIssuer,
         receipt_builder: ReceiptBuilder,
         approval_handler: ApprovalHandler | None = None,
-        egress_pep: Optional[EgressPEP] = None,
+        egress_pep: EgressPEP | None = None,
     ) -> None:
         self._store = store
         self._router = router
@@ -110,7 +106,7 @@ class Coordinator:
         # M3 XFR-001 — if set, the Coordinator runs every public-capability
         # adapter call through the EgressPEP. Local tools, sinks, and
         # in-process nodes never see the PEP.
-        self._egress_pep: Optional[EgressPEP] = egress_pep
+        self._egress_pep: EgressPEP | None = egress_pep
 
     # ------------------------------------------------------------------
     # Public API
@@ -171,7 +167,7 @@ class Coordinator:
                 # (the human is the capability) and bind directly.
                 cap_id = "human.approver"
                 capability_bindings[spec.node_id] = cap_id
-                manifest_bindings[spec.node_id] = f"manifest:human-approver"
+                manifest_bindings[spec.node_id] = "manifest:human-approver"
                 continue
             result = self._router.route(
                 node=spec,
@@ -492,8 +488,8 @@ class Coordinator:
         # before invoking the Adapter. The PEP projects the payload
         # down to the FieldManifest's allowed_fields and redactions; the
         # adapter never sees fields the manifest does not list.
-        egress_projection: Optional[dict[str, Any]] = None
-        egress_manifest: Optional[dict[str, Any]] = None
+        egress_projection: dict[str, Any] | None = None
+        egress_manifest: dict[str, Any] | None = None
         egress_dropped: list[str] = []
         egress_projected_bytes: int = 0
         if manifest.egress_view_name and self._egress_pep is not None:
@@ -669,7 +665,7 @@ class Coordinator:
         self,
         *,
         task_run_id: str,
-        node_run_id: Optional[str],
+        node_run_id: str | None,
         kind: EventKind,
         payload: dict[str, Any],
     ) -> None:
@@ -748,7 +744,7 @@ def _manifest_for_projection(manifest_dict: dict[str, Any]):
     return FieldManifest.model_validate(manifest_dict)
 
 
-def _projected_digest(projected: Optional[dict[str, Any]]) -> str:
+def _projected_digest(projected: dict[str, Any] | None) -> str:
     """Stable digest of the projected payload (matches the PEP's digest)."""
     from orchestra.core.ids import digest_json
 
@@ -820,7 +816,7 @@ def build_default_coordinator(
     *,
     store: EventStore,
     endpoints: dict[str, str] | None = None,
-    egress_pep: Optional[EgressPEP] = None,
+    egress_pep: EgressPEP | None = None,
 ) -> Coordinator:
     """Construct a Coordinator with the default registry, policy, and
     four reference Adapters.

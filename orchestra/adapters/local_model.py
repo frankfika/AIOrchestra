@@ -17,9 +17,7 @@ from typing import Any
 
 import httpx
 
-from orchestra.core.schema import DataView, NodeGrant, Purpose
 from orchestra.adapters.base import AdapterRequest, AdapterResult
-
 
 _FIELD_PATTERNS: dict[str, re.Pattern[str]] = {
     "vendor_name": re.compile(

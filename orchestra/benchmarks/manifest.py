@@ -7,7 +7,7 @@ not change between runs.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from orchestra.core.ids import content_addressed_id

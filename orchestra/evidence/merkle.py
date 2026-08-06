@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 def _h(*parts: bytes) -> str:
@@ -32,7 +31,7 @@ class MerkleProof:
     leaf_index: int
     leaf_hash: str
     siblings: list[str]
-    positions: list[Literal["L", "R"]] = field(default_factory=list)  # type: ignore[name-defined]
+    positions: list[Literal[L, R]] = field(default_factory=list)  # type: ignore[name-defined]
     root: str = ""
 
     def to_dict(self) -> dict:

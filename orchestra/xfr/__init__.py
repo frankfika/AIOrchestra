@@ -18,7 +18,7 @@ that the public Adapter does not infer sensitive content is
 out of scope for the demo and is the responsibility of the
 Adapter contract.
 """
+from orchestra.xfr.egress_pep import EgressDenied, EgressPEP
 from orchestra.xfr.projector import FieldProjector, ProjectionResult
-from orchestra.xfr.egress_pep import EgressPEP, EgressDenied
 
 __all__ = ["FieldProjector", "ProjectionResult", "EgressPEP", "EgressDenied"]

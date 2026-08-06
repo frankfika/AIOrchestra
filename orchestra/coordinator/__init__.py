@@ -14,10 +14,10 @@ The Coordinator owns the *lifecycle* of a Plan. It:
 The Event Store is PostgreSQL. The Receipt is a COSE-like HMAC envelope
 (see :mod:`orchestra.core.hashing`).
 """
+from orchestra.coordinator.engine import Coordinator, CoordinatorResult
 from orchestra.coordinator.event_store import EventStore, EventStoreUnavailable
 from orchestra.coordinator.node_grant import NodeGrantIssuer
 from orchestra.coordinator.receipt import ReceiptBuilder
-from orchestra.coordinator.engine import Coordinator, CoordinatorResult
 
 __all__ = [
     "EventStore",

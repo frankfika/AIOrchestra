@@ -16,13 +16,13 @@ the code artefacts that go with the runbooks:
 
 The runbooks themselves live under ``docs/runbooks/``.
 """
+from orchestra.ga.evidence import PilotEvidence, collect_pilot_evidence
 from orchestra.ga.slo import (
     SLO,
     SLOResult,
     compute_attainment,
     evaluate_ga_readiness,
 )
-from orchestra.ga.evidence import PilotEvidence, collect_pilot_evidence
 
 __all__ = [
     "SLO", "SLOResult", "compute_attainment", "evaluate_ga_readiness",

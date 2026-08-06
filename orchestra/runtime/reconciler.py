@@ -16,7 +16,7 @@ Coordinator surfaces to the audit timeline.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from datetime import UTC
 
 from orchestra.core.ids import new_id
 from orchestra.core.time import utc_now_iso
@@ -50,9 +50,9 @@ class Reconciler:
         node_run_states: dict[str, str],
         now_iso: str | None = None,
     ) -> ReconcilerReport:
-        from datetime import datetime, timezone
+        from datetime import datetime
 
-        now = datetime.fromisoformat(now_iso.replace("Z", "+00:00")) if now_iso else datetime.now(timezone.utc)
+        now = datetime.fromisoformat(now_iso.replace("Z", "+00:00")) if now_iso else datetime.now(UTC)
         report = ReconcilerReport(
             report_id=new_id(),
             generated_at=utc_now_iso(),

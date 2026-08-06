@@ -18,9 +18,8 @@ path.
 """
 from __future__ import annotations
 
-from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -80,13 +79,13 @@ class AgentCard(BaseModel):
     )
     status: CardStatus = CardStatus.DRAFT
     created_at: str = Field(default_factory=utc_now_iso)
-    published_at: Optional[str] = None
-    revoked_at: Optional[str] = None
+    published_at: str | None = None
+    revoked_at: str | None = None
     # The signature is computed *over* the body (excluding the
     # signature field itself). M5 uses HMAC-SHA256 like the rest of
     # the dev plan; the real partner shipping is HMAC + JWS in M6.
-    signature: Optional[str] = None
-    signer_kid: Optional[str] = None
+    signature: str | None = None
+    signer_kid: str | None = None
 
     def to_signable(self) -> dict[str, Any]:
         body = self.model_dump(mode="json", exclude={"signature", "signer_kid"})

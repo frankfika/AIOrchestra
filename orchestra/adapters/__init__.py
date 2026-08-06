@@ -20,21 +20,21 @@ behind the Local adapter is a deterministic regex+heuristic extractor on
 the contract text, not a real LLM, because we have no GPU in the demo
 sandbox; the *adapter contract* is real, the *model* is a stand-in.
 """
+from orchestra.adapters.a2a_reference import A2AReferenceAdapter
 from orchestra.adapters.base import (
     Adapter,
+    AdapterError as AdapterErrorBase,
     AdapterRequest,
     AdapterResult,
-    AdapterError as AdapterErrorBase,
 )
 from orchestra.adapters.local_model import LocalModelAdapter
-from orchestra.adapters.openai_compat import OpenAICompatAdapter
-from orchestra.adapters.a2a_reference import A2AReferenceAdapter
 from orchestra.adapters.mock_sink import MockSinkAdapter
+from orchestra.adapters.openai_compat import OpenAICompatAdapter
 from orchestra.adapters.servers import (
-    start_local_model_server,
-    start_openai_mock_server,
     start_a2a_reference_server,
+    start_local_model_server,
     start_mock_sink_server,
+    start_openai_mock_server,
 )
 
 __all__ = [

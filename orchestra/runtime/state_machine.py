@@ -10,11 +10,8 @@ The state machine is the runtime enforcement of plan §0.1.2
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 from orchestra.core.errors import ContractViolation
 from orchestra.core.schema import NodeRunState, TaskRunState
-
 
 # Task Run state machine
 TASK_TRANSITIONS: dict[TaskRunState, set[TaskRunState]] = {
