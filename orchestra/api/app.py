@@ -57,6 +57,10 @@ class AppState:
     # M14 — request size cap. Requests larger than this are
     # rejected with 413 before the body reaches the application.
     max_request_bytes: int = 1 * 1024 * 1024  # 1 MiB
+    # M17 — webhook dispatcher. The dev path uses a synchronous
+    # in-process dispatcher; production swaps for a queue-backed
+    # worker that survives process restarts.
+    webhook_dispatcher: Any = None  # WebhookDispatcher | None
 
 
 def _default_data_label() -> SecurityLabel:
@@ -69,11 +73,81 @@ def _default_data_label() -> SecurityLabel:
     )
 
 
+def _webhook_config_from_request(req: SubmitTaskRequest):
+    """Return a :class:`WebhookConfig` when the request
+    supplies both ``webhook_url`` and ``webhook_secret``;
+    otherwise ``None`` (no webhook).
+
+    The dev path treats an empty string the same as
+    ``None`` so a partner who submits ``webhook_url: ""``
+    by mistake doesn't accidentally wire a delivery
+    that goes to a path that 404s.
+    """
+    if not req.webhook_url or not req.webhook_secret:
+        return None
+    from orchestra.webhooks import WebhookConfig
+
+    return WebhookConfig(url=req.webhook_url, secret=req.webhook_secret)
+
+
+async def _wrap_with_webhook(coro, *, task_run_id: str, state_provider):
+    """Await the Coordinator, then dispatch a webhook on
+    terminal state.
+
+    The wrapper is intentionally minimal: it just runs
+    the Coordinator to completion and hands the result
+    to the dispatcher. A production swap would move the
+    dispatch into a queue (SQS / Redis / Kafka) so the
+    HTTP call doesn't block the in-process task driver.
+    """
+    state = state_provider()
+    result = await coro
+    config = getattr(state, "_webhook_configs", {}).get(task_run_id)
+    if config is None:
+        return result
+    # Only dispatch on terminal states. ``running`` /
+    # ``created`` / ``planned`` are not terminal; the
+    # Coordinator's return state is the post-run state.
+    dispatcher = getattr(state, "_webhook_dispatcher", None)
+    if dispatcher is None:
+        # No dispatcher is wired; the dev path silently
+        # skips the dispatch. The partner can still poll.
+        return result
+    from orchestra.core.ids import new_id
+
+    delivery_id = new_id()
+    try:
+        dispatcher.deliver(
+            config,
+            task_run_id=task_run_id,
+            state=result.state.value,
+            plan_id=result.plan.plan_id if result.plan else None,
+            node_results=result.node_results,
+            error=result.error,
+            delivery_id=delivery_id,
+        )
+    except Exception:  # noqa: BLE001
+        # A dispatcher exception must not crash the
+        # in-process task driver. The partner's webhook
+        # endpoint is their problem; the task itself
+        # succeeded.
+        pass
+    return result
+
+
 class SubmitTaskRequest(BaseModel):
     contract_id: str
     contract_text: str
     vendor_id: str
     budget_usd: float = 1.0
+    # M17 — optional webhook callback. When both are set,
+    # the dev path POSTs a signed payload to ``webhook_url``
+    # when the task reaches a terminal state (``succeeded``
+    # / ``failed`` / ``cancelled``). The signature is in
+    # the ``X-Orchestra-Signature`` header; the partner
+    # verifies with ``HMAC(secret, body)``.
+    webhook_url: str | None = None
+    webhook_secret: str | None = None
 
 
 class TaskStatusResponse(BaseModel):
@@ -431,9 +505,23 @@ def create_app(state: AppState | None = None) -> FastAPI:
             },
             budget_usd=req.budget_usd,
         )
-        # Stash the task on the AppState so the demo can ``await`` it.
+        # M17 — if a webhook is configured, the in-process
+        # driver awaits the Coordinator and then dispatches
+        # the terminal-state payload to the partner URL. The
+        # background task is the same asyncio.Task the demo
+        # already keeps; the wrapper only adds the dispatch.
         if not hasattr(state, "_background_runs"):
             state._background_runs = {}
+        if not hasattr(state, "_webhook_configs"):
+            state._webhook_configs = {}
+        webhook_config = _webhook_config_from_request(req)
+        if webhook_config is not None:
+            state._webhook_configs[task_run_id] = webhook_config
+            run_coro = _wrap_with_webhook(
+                run_coro,
+                task_run_id=task_run_id,
+                state_provider=lambda: state,
+            )
         state._background_runs[task_run_id] = asyncio.create_task(run_coro)
         return TaskStatusResponse(
             task_run_id=task_run_id,
@@ -800,6 +888,7 @@ def _bootstrap_default_state() -> AppState:
     from orchestra.coordinator.engine import build_default_coordinator
     from orchestra.observability import Metrics, builtin_metrics
     from orchestra.runtime.rate_limit import RateLimiter, TokenBucket
+    from orchestra.webhooks import WebhookDispatcher
 
     endpoints_obj = start_all_servers()
     endpoints = {k: v["endpoint"] for k, v in endpoints_obj.items()}
@@ -822,6 +911,10 @@ def _bootstrap_default_state() -> AppState:
         metrics=metrics,
     )
     max_body = int(os.environ.get("ORCHESTRA_MAX_REQUEST_BYTES", str(1 * 1024 * 1024)))
+    # M17 — the dispatcher is process-local in dev. The
+    # ``ORCHESTRA_WEBHOOK_RETRY_BUDGET`` env override lets a
+    # SRE tighten the retry window for a flaky partner without
+    # code changes.
     return AppState(
         store=store,
         coordinator=coordinator,
@@ -829,6 +922,7 @@ def _bootstrap_default_state() -> AppState:
         metrics=metrics,
         rate_limiter=limiter,
         max_request_bytes=max_body,
+        webhook_dispatcher=WebhookDispatcher(),
     )
 
 

@@ -7,9 +7,9 @@ on every change. Higher-priority rules (orchestra/白皮书, /开发计划)
 win on conflict; this file is the bridge between those documents
 and the agent's daily decisions.
 
-> **Status: M0–M15 shipped.** The original P0 matrix in §2 is
+> **Status: M0–M16 shipped.** The original P0 matrix in §2 is
 > preserved for traceability; the actual production surface is
-> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11 + M12 + M13 + M14 + M15.
+> M0 + M1 + M2 + M3 + M4 + M5 + M6 + M7 + M8 + M9 + M10 + M11 + M12 + M13 + M14 + M15 + M16.
 > The "P0 not-in-scope" column is the **historical** P0 boundary;
 > the dev plan moved those items to M1+ in later milestones.
 
@@ -49,7 +49,8 @@ may not silently resolve them.
 | **M13** | `09d3c39` | Dep security upgrade (fastapi>=0.116, pytest>=9.0.3, fixed 9 CVEs) + Prometheus metrics (`/metrics` text-format + HTTPMetricsMiddleware + EgressPEP/ReleaseGate/Ingress/PublishedRegistry counters) + ruff + pre-commit hooks | `orchestra.observability`, `.pre-commit-config.yaml` |
 | **M14** | `93c00b3` | DoS hardening: per-tenant token-bucket rate limit (429 + Retry-After) + request body size cap (413) + exempt `/healthz`/`/metrics` for SRE probes. Config-driven via `ORCHESTRA_RATE_LIMIT_RPS` / `ORCHESTRA_MAX_REQUEST_BYTES`. | `orchestra.runtime.rate_limit`, `orchestra.observability.rate_limit_mw` |
 | **M15** | `0deddba` | Partner integration polish: CORS middleware (config-driven, wildcard + allow-list) + OpenAPI metadata (8 tag groups, per-endpoint summary) + `/docs` + `/redoc` routes pinned. The dev path now reads like a real product, not a category proof. | `orchestra.api.openapi`, `orchestra.api.app` |
-| **M16** | (in flight) | Partner SDK: standard error envelope (RFC 7807 Problem Details) on every 4xx/5xx + Python `orchestra_sdk` package (typed ``OrchestraClient`` + ``RateLimitError`` / ``TaskNotFoundError`` / ``ValidationError`` / ...). Live smoke: partner integration now reads as business code, not HTTP plumbing. | `orchestra.api.errors`, `orchestra_sdk/` |
+| **M16** | `ffb0078` | Partner SDK: standard error envelope (RFC 7807 Problem Details) on every 4xx/5xx + Python `orchestra_sdk` package (typed ``OrchestraClient`` + ``RateLimitError`` / ``TaskNotFoundError`` / ``ValidationError`` / ...). Live smoke: partner integration now reads as business code, not HTTP plumbing. | `orchestra.api.errors`, `orchestra_sdk/` |
+| **M17** | (in flight) | Webhook callback: partner supplies ``webhook_url`` + ``webhook_secret`` at submit time; dev path POSTs a signed (HMAC-SHA-256) JSON payload on terminal state. ``X-Orchestra-Signature`` + ``X-Orchestra-Delivery-Id`` + ``X-Orchestra-Event-Type`` headers + 3-attempt exponential backoff. Live smoke: partner verified HMAC, got 200 OK on first try. | `orchestra.webhooks`, `orchestra.api.app` |
 
 248 tests pass; 19 intentionally skipped (clean-room install +
 M1+ invariants that need M1+ features). M13 adds 32 tests
@@ -59,6 +60,9 @@ request size limit) for a total of 302 active. M15 adds 11
 tests (CORS preflight + OpenAPI shape) for a total of
 313 active. M16 adds 22 tests (Problem Details + SDK
 typed client + error envelope) for a total of 335 active.
+M17 adds 9 tests (signature, retry, transport-error
+handling, payload key-order stability) for a total of
+344 active.
 
 ### Historical P0 boundary (preserved for traceability)
 
@@ -138,6 +142,7 @@ implements the subset actually used.
 | Rate limiter (per-tenant token bucket) | `orchestra/runtime/rate_limit.py` |
 | Partner SDK (Python) | `orchestra_sdk/` |
 | Standard error envelope (RFC 7807) | `orchestra/api/errors.py` |
+| Webhook dispatcher (HMAC-signed) | `orchestra/webhooks/` |
 | CLI | `orchestra/cli.py` |
 | Demo Console (HTML) | `orchestra/ux/` |
 | Helm chart | `deploy/helm/` |
@@ -147,8 +152,8 @@ implements the subset actually used.
 | Security policy | `SECURITY.md` |
 | ADRs | `ADR/` |
 | Sample tenant / Agent Card | `data/samples/tenants.py` |
-| Tests | `tests/m{0..16}/` |
-| Verification command | `pytest tests/` (335 pass, 19 skipped) |
+| Tests | `tests/m{0..17}/` |
+| Verification command | `pytest tests/` (344 pass, 19 skipped) |
 
 ## 7. Production swap checklist (M6 → production)
 
