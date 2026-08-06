@@ -30,6 +30,12 @@ from orchestra.observability import (
 )
 from orchestra.templates.contract_review import CONTRACT_REVIEW_TEMPLATE
 
+# M15 — OpenAPI metadata + CORS configuration. Imported here
+# rather than at module level so the heavy fastapi import is
+# deferred until the first call to ``create_app`` (the test
+# path that mocks the app doesn't need CORS).
+from orchestra.api.openapi import TAGS_METADATA, apply_cors, cors_origins_from_env
+
 
 @dataclass
 class AppState:
@@ -104,11 +110,37 @@ def create_app(state: AppState | None = None) -> FastAPI:
             state.store.close()
 
     app = FastAPI(
-        title="Orchestra P0 API",
-        description="Hybrid / Sovereign AI Orchestration Plane — category proof",
-        version="0.1.0-p0",
+        title="Orchestra API",
+        description=(
+            "Hybrid / Sovereign AI Orchestration Plane. The "
+            "control plane between applications (Dify, Coze, "
+            "AgenticHub, custom UIs) and execution resources "
+            "(local models, public models, A2A agents, MCP "
+            "tools, human approvers). See the white paper for "
+            "the product definition and ADR-0002 for the "
+            "P0 / M1+ boundary."
+        ),
+        version="0.1.0-m14",
+        # M15 — group the endpoints by surface so a partner
+        # developer reading /docs finds the right call without
+        # scrolling through every route.
+        openapi_tags=TAGS_METADATA,
+        # M15 — pin the docs URL. ``/docs`` (Swagger UI) and
+        # ``/redoc`` are the FastAPI defaults; the explicit
+        # declaration makes the surface discoverable from the
+        # OpenAPI spec itself.
+        docs_url="/docs",
+        redoc_url="/redoc",
         lifespan=lifespan,
     )
+
+    # M15 — CORS. Config-driven via ``ORCHESTRA_CORS_ORIGINS``.
+    # An empty value (the dev default) means CORS is off — a
+    # browser hitting the API without an allow-list still gets
+    # blocked, which is the right posture for a backend that
+    # is only consumed by SDKs / curl. Production deployments
+    # set the env var to the partner-UI origin list.
+    apply_cors(app, origins=cors_origins_from_env())
 
     # M9 — structured logging + per-request id.
     from orchestra.core.logging import RequestIdMiddleware, setup_logging
@@ -147,7 +179,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
     ux_router = build_ux_router(state_provider=lambda: state)
     app.include_router(ux_router)
 
-    @app.get("/healthz")
+    @app.get(
+        "/healthz",
+        summary="Live health check (real cluster state)",
+        tags=["Health"],
+    )
     def healthz() -> dict[str, Any]:
         """Live health check.
 
@@ -233,7 +269,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "published_card_count": n_published,
         }
 
-    @app.get("/metrics")
+    @app.get(
+        "/metrics",
+        summary="Prometheus text-format metrics",
+        tags=["Metrics"],
+    )
     def metrics() -> Response:
         """Prometheus text-format metrics export.
 
@@ -247,11 +287,19 @@ def create_app(state: AppState | None = None) -> FastAPI:
         body = render_prometheus(state.metrics)
         return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
 
-    @app.get("/templates")
+    @app.get(
+        "/templates",
+        summary="Get the contract-review template",
+        tags=["Templates"],
+    )
     def templates() -> dict[str, Any]:
         return CONTRACT_REVIEW_TEMPLATE.model_dump(mode="json")
 
-    @app.get("/capabilities")
+    @app.get(
+        "/capabilities",
+        summary="List registered capabilities + policy rules",
+        tags=["Capabilities"],
+    )
     def capabilities() -> dict[str, Any]:
         return {
             "manifests": [
@@ -260,7 +308,12 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "policy_rule_count": len(state.coordinator._router._policy._rules),
         }
 
-    @app.post("/tasks", response_model=TaskStatusResponse)
+    @app.post(
+        "/tasks",
+        response_model=TaskStatusResponse,
+        summary="Submit a task",
+        tags=["Tasks"],
+    )
     async def submit_task(req: SubmitTaskRequest) -> TaskStatusResponse:
         task_run_id = new_id()
         # Persist the task row up front so the API can return a stable
@@ -295,7 +348,12 @@ def create_app(state: AppState | None = None) -> FastAPI:
             error=None,
         )
 
-    @app.get("/tasks/{task_run_id}", response_model=TaskStatusResponse)
+    @app.get(
+        "/tasks/{task_run_id}",
+        response_model=TaskStatusResponse,
+        summary="Get task status",
+        tags=["Tasks"],
+    )
     def get_task(task_run_id: str) -> TaskStatusResponse:
         row = state.store.get_task_run(task_run_id)
         if row is None:
@@ -308,12 +366,20 @@ def create_app(state: AppState | None = None) -> FastAPI:
             error=None,
         )
 
-    @app.get("/tasks/{task_run_id}/events")
+    @app.get(
+        "/tasks/{task_run_id}/events",
+        summary="List task events (audit timeline)",
+        tags=["Tasks"],
+    )
     def get_events(task_run_id: str) -> dict[str, Any]:
         events = state.store.list_events(task_run_id=task_run_id)
         return {"task_run_id": task_run_id, "count": len(events), "events": events}
 
-    @app.get("/tasks/{task_run_id}/receipts")
+    @app.get(
+        "/tasks/{task_run_id}/receipts",
+        summary="List signed receipts (with verification status)",
+        tags=["Tasks"],
+    )
     def get_receipts(task_run_id: str) -> dict[str, Any]:
         from orchestra.core.schema import SignedReceipt
 
@@ -338,15 +404,27 @@ def create_app(state: AppState | None = None) -> FastAPI:
             verified_out.append(r)
         return {"task_run_id": task_run_id, "receipts": verified_out}
 
-    @app.get("/tasks/{task_run_id}/grants")
+    @app.get(
+        "/tasks/{task_run_id}/grants",
+        summary="List Node Grants issued for the task",
+        tags=["Tasks"],
+    )
     def get_grants(task_run_id: str) -> dict[str, Any]:
         return {"task_run_id": task_run_id, "grants": state.store.list_grants(task_run_id)}
 
-    @app.get("/tasks/{task_run_id}/approvals")
+    @app.get(
+        "/tasks/{task_run_id}/approvals",
+        summary="List approval decisions (audit timeline)",
+        tags=["Tasks"],
+    )
     def get_approvals(task_run_id: str) -> dict[str, Any]:
         return {"task_run_id": task_run_id, "approvals": state.store.list_approvals(task_run_id)}
 
-    @app.post("/tasks/{task_run_id}/approve")
+    @app.post(
+        "/tasks/{task_run_id}/approve",
+        summary="Approve a paused task",
+        tags=["Tasks"],
+    )
     async def approve(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         try:
             await state.coordinator.decide_approval(
@@ -360,7 +438,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(400, str(e))
         return {"status": "approved"}
 
-    @app.post("/tasks/{task_run_id}/reject")
+    @app.post(
+        "/tasks/{task_run_id}/reject",
+        summary="Reject a paused task",
+        tags=["Tasks"],
+    )
     async def reject(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         try:
             await state.coordinator.decide_approval(
@@ -374,7 +456,12 @@ def create_app(state: AppState | None = None) -> FastAPI:
             raise HTTPException(400, str(e))
         return {"status": "rejected"}
 
-    @app.post("/benchmark/run", response_model=BenchmarkResult)
+    @app.post(
+        "/benchmark/run",
+        response_model=BenchmarkResult,
+        summary="Run the 3-baseline benchmark",
+        tags=["Capabilities"],
+    )
     def run_benchmark() -> BenchmarkResult:
         if state.benchmark_runner is None:
             raise HTTPException(503, "benchmark runner not initialised")
@@ -389,23 +476,45 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # handlers are thin proxies to the same Coordinator / EventStore
     # the JSON API uses — there is no second source of truth.
 
-    @app.post("/api/v1/orchestra/submit", response_model=TaskStatusResponse)
+    @app.post(
+        "/api/v1/orchestra/submit",
+        response_model=TaskStatusResponse,
+        summary="[AgenticHub] Submit a task",
+        tags=["AgenticHub"],
+    )
     async def ah_submit(req: SubmitTaskRequest) -> TaskStatusResponse:
         return await submit_task(req)
 
-    @app.get("/api/v1/orchestra/tasks/{task_run_id}", response_model=TaskStatusResponse)
+    @app.get(
+        "/api/v1/orchestra/tasks/{task_run_id}",
+        response_model=TaskStatusResponse,
+        summary="[AgenticHub] Get task status",
+        tags=["AgenticHub"],
+    )
     def ah_get_task(task_run_id: str) -> TaskStatusResponse:
         return get_task(task_run_id)
 
-    @app.get("/api/v1/orchestra/tasks/{task_run_id}/events")
+    @app.get(
+        "/api/v1/orchestra/tasks/{task_run_id}/events",
+        summary="[AgenticHub] List task events",
+        tags=["AgenticHub"],
+    )
     def ah_get_events(task_run_id: str) -> dict[str, Any]:
         return get_events(task_run_id)
 
-    @app.get("/api/v1/orchestra/tasks/{task_run_id}/grants")
+    @app.get(
+        "/api/v1/orchestra/tasks/{task_run_id}/grants",
+        summary="[AgenticHub] List Node Grants",
+        tags=["AgenticHub"],
+    )
     def ah_get_grants(task_run_id: str) -> dict[str, Any]:
         return get_grants(task_run_id)
 
-    @app.post("/api/v1/orchestra/tasks/{task_run_id}/decide")
+    @app.post(
+        "/api/v1/orchestra/tasks/{task_run_id}/decide",
+        summary="[AgenticHub] Decide a pending approval",
+        tags=["AgenticHub"],
+    )
     async def ah_decide(task_run_id: str, body: ApprovalRequest) -> dict[str, str]:
         """Decide a pending approval (approve / reject)."""
         decision = (
@@ -436,7 +545,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # context (admin role) so the multi-tenant IsolatingEventStore is
     # exercised end-to-end through the same HTTP path the CLI uses.
 
-    @app.post("/admin/tenants")
+    @app.post(
+        "/admin/tenants",
+        summary="Create a tenant",
+        tags=["Admin"],
+    )
     def admin_create_tenant(body: dict) -> dict:
         from orchestra.enterprise.isolation import IsolatingEventStore
         from orchestra.enterprise.tenant import (
@@ -467,7 +580,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
         finally:
             reset_active(token)
 
-    @app.get("/admin/tenants")
+    @app.get(
+        "/admin/tenants",
+        summary="List tenants",
+        tags=["Admin"],
+    )
     def admin_list_tenants() -> dict:
         from orchestra.enterprise.isolation import IsolatingEventStore
         from orchestra.enterprise.tenant import (
@@ -494,7 +611,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
         finally:
             reset_active(token)
 
-    @app.post("/admin/publish")
+    @app.post(
+        "/admin/publish",
+        summary="Publish an Agent Card",
+        tags=["Admin"],
+    )
     def admin_publish(body: dict) -> dict:
         """Publish an Agent Card. The body is a Card-shaped dict;
         status is forced to PUBLISHED and the body is signed with
@@ -536,7 +657,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
         state._registry = registry
         return signed.model_dump(mode="json")
 
-    @app.get("/admin/publish")
+    @app.get(
+        "/admin/publish",
+        summary="List published Agent Cards",
+        tags=["Admin"],
+    )
     def admin_list_published() -> dict:
         if not hasattr(state, "_registry"):
             return {"cards": []}
@@ -552,7 +677,11 @@ def create_app(state: AppState | None = None) -> FastAPI:
             )
         return {"cards": out}
 
-    @app.post("/admin/publish/{capability_id}/{version}/revoke")
+    @app.post(
+        "/admin/publish/{capability_id}/{version}/revoke",
+        summary="Revoke a published Agent Card",
+        tags=["Admin"],
+    )
     def admin_revoke(capability_id: str, version: str, body: dict | None = None) -> dict:
         if not hasattr(state, "_registry"):
             raise HTTPException(404, "no published cards")

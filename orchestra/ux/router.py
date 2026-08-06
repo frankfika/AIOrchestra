@@ -10,6 +10,7 @@ Mounted at the API root by :func:`orchestra.api.app.create_app`. Exposes:
   * ``GET  /api/capabilities`` (JSON) — mirror of ``/capabilities`` for
                                        the platform view
 """
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -35,15 +36,29 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
     """
     router = APIRouter()
 
-    @router.get("/", response_class=HTMLResponse)
+    @router.get(
+        "/",
+        response_class=HTMLResponse,
+        summary="Home (Business view)",
+        tags=["UX"],
+    )
     async def home(request: Request) -> HTMLResponse:
         body = render_business_view(
-            contract="ctr-001", vendor_id="demo-vendor-001",
-            task_run_id=None, task_state=None, node_results={},
+            contract="ctr-001",
+            vendor_id="demo-vendor-001",
+            task_run_id=None,
+            task_state=None,
+            node_results={},
         )
-        return HTMLResponse(render_layout(role="business", title="Business", body_html=body, current_path="/"))
+        return HTMLResponse(
+            render_layout(role="business", title="Business", body_html=body, current_path="/")
+        )
 
-    @router.post("/ux/tasks")
+    @router.post(
+        "/ux/tasks",
+        summary="Submit Task (HTML form)",
+        tags=["UX"],
+    )
     async def submit_task(
         contract_id: str = Form(...),
         vendor_id: str = Form(...),
@@ -73,6 +88,7 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         )
         # Fire-and-forget. The UX page polls /platform and /security.
         import asyncio
+
         run = state.coordinator.run(
             task_run_id=task_run_id,
             contract_id=contract_id,
@@ -91,18 +107,33 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         state._background_runs[task_run_id] = asyncio.create_task(run)
         return RedirectResponse(url=f"/platform/{task_run_id}", status_code=303)
 
-    @router.post("/ux/tasks/{task_run_id}/approve")
+    @router.post(
+        "/ux/tasks/{task_run_id}/approve",
+        summary="Approve From Console (HTML form)",
+        tags=["UX"],
+    )
     async def approve_from_console(
-        task_run_id: str, decision: str = Form(...), decided_by: str = Form("console-user"), rationale: str = Form(""),
+        task_run_id: str,
+        decision: str = Form(...),
+        decided_by: str = Form("console-user"),
+        rationale: str = Form(""),
     ):
         state = state_provider()
         await state.coordinator.decide_approval(
-            task_run_id, "human_approval",
-            decision=decision, decided_by=decided_by, rationale=rationale,
+            task_run_id,
+            "human_approval",
+            decision=decision,
+            decided_by=decided_by,
+            rationale=rationale,
         )
         return RedirectResponse(url=f"/security/{task_run_id}", status_code=303)
 
-    @router.get("/platform/{task_run_id}", response_class=HTMLResponse)
+    @router.get(
+        "/platform/{task_run_id}",
+        response_class=HTMLResponse,
+        summary="Platform View (Route Preview + Permission)",
+        tags=["UX"],
+    )
     async def platform_view(task_run_id: str) -> HTMLResponse:
         state = state_provider()
         row = state.store.get_task_run(task_run_id)
@@ -118,9 +149,21 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
             events=events,
             grants=grants,
         )
-        return HTMLResponse(render_layout(role="platform", title=f"Platform — {task_run_id[:8]}", body_html=body, current_path=f"/platform/{task_run_id}"))
+        return HTMLResponse(
+            render_layout(
+                role="platform",
+                title=f"Platform — {task_run_id[:8]}",
+                body_html=body,
+                current_path=f"/platform/{task_run_id}",
+            )
+        )
 
-    @router.get("/security/{task_run_id}", response_class=HTMLResponse)
+    @router.get(
+        "/security/{task_run_id}",
+        response_class=HTMLResponse,
+        summary="Security View (Audit Timeline + Receipts)",
+        tags=["UX"],
+    )
     async def security_view(task_run_id: str) -> HTMLResponse:
         state = state_provider()
         row = state.store.get_task_run(task_run_id)
@@ -130,6 +173,7 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         receipts = state.store.get_receipts(task_run_id)
         # Verify each receipt.
         from orchestra.core.schema import SignedReceipt
+
         for r in receipts:
             try:
                 receipt = SignedReceipt(
@@ -153,9 +197,8 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         # Append an approval form when the task is awaiting approval.
         task_state = row.get("state", "")
         if task_state == "awaiting-approval" or any(
-            e["kind"] == "node.awaiting-approval" and not any(
-                a.get("decision") for a in approvals
-            ) for e in events
+            e["kind"] == "node.awaiting-approval" and not any(a.get("decision") for a in approvals)
+            for e in events
         ):
             body += f"""
 <section class="card">
@@ -174,11 +217,25 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
   </form>
 </section>
 """
-        return HTMLResponse(render_layout(role="security", title=f"Security — {task_run_id[:8]}", body_html=body, current_path=f"/security/{task_run_id}"))
+        return HTMLResponse(
+            render_layout(
+                role="security",
+                title=f"Security — {task_run_id[:8]}",
+                body_html=body,
+                current_path=f"/security/{task_run_id}",
+            )
+        )
 
-    @router.get("/api/capabilities", response_class=JSONResponse)
+    @router.get(
+        "/api/capabilities",
+        response_class=JSONResponse,
+        summary="Capabilities JSON (mirror of /capabilities)",
+        tags=["UX"],
+    )
     async def capabilities_json() -> JSONResponse:
         state = state_provider()
-        return JSONResponse([m.model_dump(mode="json") for m in state.coordinator._router._store.all()])
+        return JSONResponse(
+            [m.model_dump(mode="json") for m in state.coordinator._router._store.all()]
+        )
 
     return router
