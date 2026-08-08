@@ -40,14 +40,17 @@ def test_ux_home_renders_business_form():
     r = client.get("/")
     assert r.status_code == 200
     body = r.text
-    assert "Orchestra M3 Demo Console" in body
+    # M23 — header now says "Orchestra" with an M23 badge (was
+    # frozen at "M3 Demo Console" pre-modernization).
+    assert "Orchestra" in body
+    assert "M23" in body
     assert "Submit Contract Review" in body
     # The form must POST to /ux/tasks (the UX-only path; the JSON
     # API keeps a clean POST /tasks for Dify / AgenticHub).
     assert 'action="/ux/tasks"' in body
-    # FieldManifest / Egress references in the footer (so the page
-    # advertises what the demo is for).
-    assert "M3 Governed Hybrid E2E" in body
+    # M23 — the footer now mentions M23 (the version) instead of
+    # the historical "M3 Governed Hybrid E2E" string.
+    assert "M23" in body
 
 
 def test_ux_role_nav_present():
@@ -93,15 +96,22 @@ def test_ux_capabilities_json_returns_list():
 
 def test_ux_render_layout_escapes_user_input():
     """The HTML renderer escapes all dynamic values so a malicious
-    contract_text never injects script tags."""
+    contract_id / vendor_id in the recent-tasks panel never injects
+    script tags. M23 — the old signature passed ``contract`` /
+    ``vendor_id`` directly; the new signature pulls them from a
+    ``recent_tasks`` list, so we exercise XSS through a task row.
+    """
     from orchestra.ux.templates import render_business_view, render_layout
 
     body = render_business_view(
-        contract="<script>alert('xss')</script>",
-        vendor_id='"><img src=x onerror=alert(1)>',
-        task_run_id=None,
-        task_state=None,
-        node_results={},
+        recent_tasks=[
+            {
+                "task_run_id": "<script>alert('xss')</script>",
+                "contract_id": '"><img src=x onerror=alert(1)>',
+                "state": "running",
+                "created_at": "2026-08-08T00:00:00",
+            }
+        ],
     )
     html = render_layout(role="business", title="t", body_html=body, current_path="/")
     # Both payloads are escaped — the literal "<script>" tag never
@@ -172,8 +182,10 @@ def test_ux_security_renders_xfr_digest_in_audit_timeline(dsn, db_available):
     # The audit timeline lists the io.sent rows for the public
     # capability. The renderer shows the digest as `<code>...</code>`.
     assert "io.sent" in body
-    # The XFR-001 marker: "view=" appears in the digest row.
-    assert "view=" in body
+    # M23 — the XFR-001 marker is now an event-detail card with
+    # a "view <b>...</b>" pill (was "view=..." in the old JSON-pre
+    # dump). The semantic is the same; the literal string changed.
+    assert ">view<" in body or "view " in body
     # The renderer should mention "digest" as the visible label.
     assert "digest" in body
     # The raw contract text must NOT be rendered.

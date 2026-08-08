@@ -119,6 +119,18 @@ class Coordinator:
     # Public API
     # ------------------------------------------------------------------
 
+    def list_capabilities(self) -> list[Any]:
+        """M23 — Public read of the capability registry.
+
+        Replaces the previous ``_router._store.all()`` traversal
+        from the Demo Console (router.py:145, 238). The router no
+        longer reaches into private attributes; the Coordinator
+        owns the read path and can swap the underlying source
+        (Postgres / agent card federation) without changing the
+        UX.
+        """
+        return list(self._router._store.all())
+
     async def run(
         self,
         *,

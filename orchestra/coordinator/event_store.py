@@ -184,6 +184,25 @@ class EventStore:
             )
             return cur.fetchone()
 
+    def list_recent_task_runs(self, limit: int = 20) -> list[dict[str, Any]]:
+        """M23 — Return the most recently created task runs.
+
+        Powers the Demo Console's "Recent tasks" panel so a user
+        who lost the URL of a task they just submitted can still
+        find it. Ordered by ``created_at DESC`` so the newest
+        submission always shows at the top of the list.
+        """
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT task_run_id, contract_id, template_id, state, "
+                "       created_at, updated_at "
+                "FROM task_runs "
+                "ORDER BY created_at DESC "
+                "LIMIT %s",
+                (int(limit),),
+            )
+            return list(cur.fetchall())
+
     # -- node_runs ---------------------------------------------------------
 
     def upsert_node_run(
