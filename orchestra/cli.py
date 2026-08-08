@@ -605,6 +605,118 @@ def cmd_retention_job_retry(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# M24 W4: Pilot operations primitives (M24-OPS-001)
+# ---------------------------------------------------------------------------
+
+
+def cmd_kms_rotate(args: argparse.Namespace) -> int:
+    """Rotate the active KMS signing key.
+
+    The new ``kid`` is printed. The old key remains valid
+    until the on-call revokes it after the rotation window
+    elapses.
+    """
+    from orchestra.enterprise.connectors import InMemoryKMSKeyProvider  # noqa: PLC0415
+    from orchestra.enterprise.ops import rotate_kms_key  # noqa: PLC0415
+
+    provider = InMemoryKMSKeyProvider()
+    try:
+        result = rotate_kms_key(provider, old_kid=args.kid)
+    except KeyError as e:
+        print(f"rotation refused: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"rotated: old={result.old_kid} new={result.new_kid} "
+        f"algorithm={result.algorithm} at={result.rotated_at}"
+    )
+    return 0
+
+
+def cmd_webhook_secret_rotate(args: argparse.Namespace) -> int:
+    """Generate a fresh webhook HMAC secret for a partner.
+
+    The new secret is printed exactly once. Copy it into
+    the partner's secret store immediately. The previous
+    secret is hashed for audit; the plaintext is discarded.
+    """
+    from orchestra.enterprise.ops import rotate_webhook_secret  # noqa: PLC0415
+
+    result = rotate_webhook_secret(
+        partner=args.partner,
+        current_secret=args.current or None,
+    )
+    print(f"partner: {result.partner}")
+    print(f"new_secret: {result.new_secret}")
+    print(f"old_secret_sha256: {result.old_secret_sha256}")
+    return 0
+
+
+def cmd_pilot_drill(args: argparse.Namespace) -> int:
+    """Exercise the M24 safety path end-to-end (offline).
+
+    The drill creates a break-glass request, sweeps the
+    active set, creates + releases a legal hold, and verifies
+    that deletion is blocked while the hold is active. The
+    full report is printed as JSON; ``passed`` is the
+    non-zero exit signal.
+    """
+    import json as _json  # noqa: PLC0415
+
+    from orchestra.enterprise.connectors import InMemoryKMSKeyProvider  # noqa: PLC0415
+    from orchestra.enterprise.lifecycle import (  # noqa: PLC0415
+        InMemoryDevArtifactStore,
+        LifecycleManager,
+    )
+    from orchestra.enterprise.break_glass import BreakGlassService  # noqa: PLC0415
+    from orchestra.enterprise.ops import run_pilot_drill  # noqa: PLC0415
+
+    # The drill runs against a synthetic in-memory stack so
+    # it never touches the live DB. The Pilot operator runs
+    # this from the maintenance box.
+    kms = InMemoryKMSKeyProvider()
+    artifact_store = InMemoryDevArtifactStore()
+
+    # We don't have a real EventStore here, so the drill
+    # degrades gracefully: the report is still produced
+    # with the steps the offline run can complete. In the
+    # production run, ``/admin/pilot-drill`` is the live
+    # version.
+    from orchestra.enterprise.break_glass import BreakGlassService  # noqa: PLC0415
+    from orchestra.enterprise.break_glass import EventKind  # noqa: PLC0415
+
+    class _StubStore:
+        def list_break_glass_for_tenant(self, tenant_id, state=None):
+            return []
+
+        def record_audit(self, kind, actor, payload):
+            return None
+
+    bg = BreakGlassService(store=_StubStore(), kms=kms)
+    lifecycle = LifecycleManager(
+        store=_StubStore(),  # type: ignore[arg-type]
+        artifact_store=artifact_store,
+    )
+    report = run_pilot_drill(
+        tenant_id=args.tenant,
+        break_glass_service=bg,
+        lifecycle=lifecycle,
+    )
+    print(_json.dumps(
+        {
+            "tenant_id": report.tenant_id,
+            "passed": report.passed,
+            "summary": report.summary,
+            "steps": [
+                {"name": s.name, "ok": s.ok, "detail": s.detail}
+                for s in report.steps
+            ],
+        },
+        indent=2,
+    ))
+    return 0 if report.passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orchestra", description="Orchestra CLI (M4 OSS-001)")
     p.add_argument("--base", default=_default_base(), help="Orchestra API base URL")
@@ -686,6 +798,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Break-glass admin (ADR-0012; M24 SEC-001 / SEC-002)",
     )
     bg_sub = s.add_subparsers(dest="breakglass_command", required=True)
+
+    # --- M24 W4: Pilot operations (M24-OPS-001) ---------------------------
+    s = sub.add_parser("kms", help="KMS key admin (M24 OPS-001)")
+    kms_sub = s.add_subparsers(dest="kms_command", required=True)
+    s2 = kms_sub.add_parser("rotate", help="Rotate the active signing key")
+    s2.add_argument(
+        "--kid", default=None, help="key id to rotate (default: most recently created)"
+    )
+    s2.set_defaults(func=cmd_kms_rotate)
+
+    s = sub.add_parser(
+        "webhook-secret", help="Webhook HMAC secret admin (M24 OPS-001)"
+    )
+    wh_sub = s.add_subparsers(dest="webhook_secret_command", required=True)
+    s2 = wh_sub.add_parser("rotate", help="Generate a fresh partner HMAC secret")
+    s2.add_argument("--partner", required=True, help="partner id")
+    s2.add_argument(
+        "--current", default=None, help="current secret (hashed for audit, plaintext discarded)"
+    )
+    s2.set_defaults(func=cmd_webhook_secret_rotate)
+
+    s = sub.add_parser(
+        "pilot-drill",
+        help="End-to-end M24 safety drill (M24 OPS-001)",
+    )
+    s.add_argument(
+        "--tenant",
+        required=True,
+        help="tenant id under which to run the synthetic drill",
+    )
+    s.set_defaults(func=cmd_pilot_drill)
 
     s2 = bg_sub.add_parser("request", help="Create a break-glass request")
     s2.add_argument("--tenant", required=True, help="tenant id (e.g. tenant:acme)")

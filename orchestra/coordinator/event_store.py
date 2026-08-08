@@ -761,6 +761,18 @@ class EventStore:
                 )
             return list(cur.fetchall())
 
+    def list_pending_approvals(self) -> list[dict[str, Any]]:
+        """Return every approval row still in ``pending`` state.
+
+        Used by ``/healthz`` and the on-call drill to surface
+        the persistent-approval backlog across all tenants.
+        """
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM approvals WHERE state='pending' ORDER BY requested_at"
+            )
+            return list(cur.fetchall())
+
     def list_approval_decisions(self, approval_id: str) -> list[dict[str, Any]]:
         with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
             cur.execute(

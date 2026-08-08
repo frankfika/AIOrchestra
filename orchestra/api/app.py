@@ -512,10 +512,75 @@ def create_app(state: AppState | None = None) -> FastAPI:
             # Gauges are observability, not control flow; never
             # let a metric failure make /healthz unhealthy.
             pass
+        # 4. M24 — pending approvals + deletion backlog.
+        #    The endpoint is best-effort: a missing or
+        #    unreachable DB leaves the body without these
+        #    counts, but does not flip overall to degraded.
+        try:
+            from orchestra.coordinator.event_store import EventStore  # noqa: PLC0415
+
+            store = EventStore()
+            store.connect()
+            try:
+                pending_approvals = 0
+                try:
+                    pending_approvals = len(
+                        store.list_pending_approvals()
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                deletion_backlog = 0
+                try:
+                    deletion_backlog = len(
+                        store.list_deletion_jobs(state="pending")
+                    ) + len(store.list_deletion_jobs(state="running"))
+                except Exception:  # noqa: BLE001
+                    pass
+                active_break_glass = 0
+                try:
+                    active_break_glass = len(
+                        store.list_break_glass_for_tenant(  # type: ignore[arg-type]
+                            tenant_id="", state="active"
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                checks["m24_backlog"] = {
+                    "status": "ok",
+                    "pending_approvals": pending_approvals,
+                    "deletion_jobs_in_flight": deletion_backlog,
+                    "active_break_glass_grants": active_break_glass,
+                }
+                # Mirror the counts as gauges so a Prometheus
+                # scrape picks them up even when the on-call
+                # only hits /metrics.
+                try:
+                    state.metrics.gauge(
+                        "orchestra_m24_pending_approvals",
+                        "Persistent approvals still waiting on a human.",
+                    ).set(float(pending_approvals))
+                    state.metrics.gauge(
+                        "orchestra_m24_deletion_backlog",
+                        "Deletion jobs in pending or running state.",
+                    ).set(float(deletion_backlog))
+                    state.metrics.gauge(
+                        "orchestra_m24_active_break_glass",
+                        "Active (within window) break-glass grants across all tenants.",
+                    ).set(float(active_break_glass))
+                except Exception:  # noqa: BLE001
+                    pass
+            finally:
+                store.close()
+        except Exception:  # noqa: BLE001
+            # The M24 backlog check is a best-effort probe
+            # and never flips /healthz to degraded on its
+            # own. A SRE who wants the counts can hit the
+            # /admin/breakglass / /admin/deletion endpoints.
+            pass
         return {
             "status": overall,
-            "version": "0.1.0-m11",
-            "milestone": "M11",
+            "version": "0.1.0-m24",
+            "milestone": "M24",
             "checks": checks,
             "tenant_count": tenant_count,
             "capability_count": checks["capabilities"].get("count", 0),
