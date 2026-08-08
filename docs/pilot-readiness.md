@@ -1,4 +1,4 @@
-# Pilot-Readiness Closing Report — Orchestra M0–M22
+# Pilot-Readiness Closing Report — Orchestra M0–M24
 
 > **Audience:** Frank (owner), design-partner engineering leads, the
 > M7 GA gate, and the next operator who picks this up.
@@ -12,7 +12,7 @@
 >    Frank's partner / cloud / legal inputs vs what can be done
 >    unblocked.
 
-This is the closing artifact for the M0–M21 push sequence. The
+This is the closing artifact for the M0–M24 push sequence. The
 project is **pilot-ready**: a design partner can stand up the
 control plane from `docs/runbooks/install.md` in under 15 minutes
 and submit a real task end-to-end against the M3 E2E flow.
@@ -92,16 +92,20 @@ state** of each invariant in the code.
 | 20 | Delegation permission = parent × contract × policy × capability | `orchestra.compiler.binding_closure` + `orchestra.runtime.credential_broker` | ✅ Enforced (M1 + M2) |
 | 21 | Adapter/Runtime compromised can't access unplanned resources | `orchestra.xfr.egress_pep` + `orchestra.runtime.credential_broker` + `orchestra.artifact.store` | ✅ Enforced (M2 + M3) |
 | 22 | High-risk side effect has Intent/Outcome reconciliation | `orchestra.coordinator.engine` + `orchestra.evidence.merkle` | ✅ Enforced (M2 + M3) |
-| 23 | Break-glass can't lower label or bypass Zero-Egress | `orchestra.enterprise.tenant` + `orchestra.enterprise.isolation` + `orchestra.coordinator.engine` (approval path) | ⚠️ Partial — schema + audit path in place, dual-control + timed window is M23 follow-up. P0/P1 single approver only. |
-| 24 | Signed objects support rotation / revocation / migration / compromise recovery | `orchestra.runtime.credential_broker` + `orchestra.enterprise.supply_chain` (Provenance) | ✅ Enforced (M2 + M6). Production KMS swap covered in M6. |
+| 23 | Break-glass can't lower label or bypass Zero-Egress | `orchestra.enterprise.break_glass.BreakGlassService` + `orchestra.enterprise.approval.ApprovalService` + `orchestra.coordinator.engine` | ✅ Enforced (M24). Two-person control state machine, applicant-cannot-approve, 15-min default window with 4 h hard cap, effect-ceiling check (no `disable_egress_pep`, no label downgrade, no RESTRICTED→public), bounded active window, sweep that moves active → expired, persistent approval workflow with restart recovery + atomic CAS. |
+| 24 | Signed objects support rotation / revocation / migration / compromise recovery | `orchestra.runtime.credential_broker` + `orchestra.enterprise.supply_chain` (Provenance) + `orchestra.enterprise.ops.rotate_kms_key` | ✅ Enforced (M2 + M6 + M24). M24 added the Pilot rotation CLI/API path. |
 | 25 | Production artefact / Policy / Adapter / Manifest / Card signature-verified | `orchestra.enterprise.supply_chain` + `orchestra.publishing.registry` | ✅ Enforced (M5 + M6) |
-| 26 | Delete / retain / Legal Hold covers all copies | `orchestra.artifact.store` + `orchestra.evidence.merkle` + `orchestra.enterprise.tenant` | ⚠️ Partial — schema + tenant isolation in place; full lifecycle sweep across replicas + Legal-Hold UX is M23+ follow-up. |
+| 26 | Delete / retain / Legal Hold covers all copies | `orchestra.enterprise.lifecycle.LifecycleManager` + `orchestra.enterprise.tenant` + `orchestra.artifact.store` | ✅ Enforced (M24). LifecycleManager over 6 resource kinds (artifact, receipt, event, webhook, cache, backup), policy round-trip, Legal Hold create/list/release, `is_held` gate, idempotent `create_deletion_job`, `execute_deletion` state machine (pending → running → deleted / partial / failed), retry, cross-tenant denial, InMemoryDevArtifactStore, WebhookDeleter / WebhookLookup protocols. **One known ADR divergence**: `delete()` permits deletion when no policy is set; ADR preamble says "unknown retention → no auto-delete". Tracked as M24 follow-up. |
 
-**Two invariants are intentionally "Partial"** (#23, #26). Both
-have the schema and the audit trail; what remains is the
-operational surface (dual-control UX, Legal-Hold UX) and the
-production-swap item (legal counsel sign-off on retention
-policy). These are M23+ work items; see §4.
+**M24 closed both Partials** — invariant #23 (Break-glass two-person
+control + persistent approval) and invariant #26 (Retention /
+Legal Hold lifecycle) are now ✅ Enforced in code. One ADR
+divergence is tracked as a follow-up (#26: `delete()` allows
+deletion when no policy is set; the ADR preamble's stricter
+"unknown retention → no auto-delete" default is not yet
+enforced). M24 also shipped the Pilot Operations layer
+(KMS rotation, webhook HMAC secret rotation, M24 safety-path
+drill, /healthz backlog signals, pilot-drill runbook).
 
 ---
 
