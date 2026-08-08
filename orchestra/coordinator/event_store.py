@@ -571,30 +571,61 @@ class EventStore:
         import json as _json
 
         with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            # M24 — the ``approvals`` table has a non-unique
+            # index on ``(task_run_id, node_id)`` (so legacy
+            # pre-M24 rows don't conflict with the new schema).
+            # Idempotency is enforced at the application layer:
+            # SELECT-FOR-UPDATE the existing row first; if
+            # missing, INSERT. The lock prevents a racing
+            # insert from sneaking through.
             cur.execute(
                 """
-                INSERT INTO approvals
-                  (approval_id, task_run_id, node_id, tenant_id, version,
-                   state, required_approvers, requested_at, requested_by, ticket)
-                VALUES (%s, %s, %s, %s, 0, 'pending', %s, now(), %s, %s)
-                ON CONFLICT (task_run_id, node_id) DO UPDATE
-                  SET state = approvals.state
-                RETURNING *
+                SELECT * FROM approvals
+                WHERE task_run_id = %s AND node_id = %s
+                FOR UPDATE
                 """,
-                (
-                    f"apv:{new_id()[:12]}",
-                    task_run_id,
-                    node_id,
-                    tenant_id,
-                    int(required_approvers),
-                    requested_by,
-                    ticket,
-                ),
+                (task_run_id, node_id),
             )
-            row = cur.fetchone()
-        # Coerce JSONB columns back to dicts for the response.
+            existing = cur.fetchone()
+            if existing is not None:
+                row = existing
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO approvals
+                      (approval_id, task_run_id, node_id, tenant_id, version,
+                       state, required_approvers, requested_at, requested_by, ticket)
+                    VALUES (%s, %s, %s, %s, 0, 'pending', %s, now(), %s, %s)
+                    RETURNING *
+                    """,
+                    (
+                        f"apv:{new_id()[:12]}",
+                        task_run_id,
+                        node_id,
+                        tenant_id,
+                        int(required_approvers),
+                        requested_by,
+                        ticket,
+                    ),
+                )
+                row = cur.fetchone()
+        # Coerce to the M24 ApprovalRecord shape. The DB row
+        # also carries the legacy P0 columns (decision,
+        # decided_by, rationale) that the new model doesn't
+        # accept; we drop them. ``requested_at`` comes back as
+        # ``datetime`` from psycopg; the model wants a string.
         if isinstance(row.get("decision_payload"), str):
             row["decision_payload"] = _json.loads(row["decision_payload"])
+        for legacy in ("decision", "decided_by", "rationale"):
+            row.pop(legacy, None)
+        if row.get("requested_at") is not None and not isinstance(
+            row["requested_at"], str
+        ):
+            row["requested_at"] = str(row["requested_at"])
+        if row.get("decided_at") is not None and not isinstance(
+            row["decided_at"], str
+        ):
+            row["decided_at"] = str(row["decided_at"])
         return ApprovalRecord.model_validate(row)
 
     def record_approval_decision(
@@ -1020,19 +1051,64 @@ class EventStore:
     def list_legal_holds(
         self, tenant_id: str, *, active_only: bool = True
     ) -> list[dict[str, Any]]:
+        """Return holds for a tenant with the resources
+        rolled up as two parallel lists (``resource_kind``
+        and ``resource_id``) so a caller can match a
+        specific resource without a second query.
+        """
         with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
             if active_only:
                 cur.execute(
-                    "SELECT * FROM legal_holds WHERE tenant_id=%s AND released_at IS NULL "
-                    "ORDER BY created_at DESC",
+                    "SELECT h.*, "
+                    "       COALESCE("
+                    "           (SELECT json_agg(json_build_object("
+                    "                'resource_kind', r.resource_kind,"
+                    "                'resource_id', r.resource_id"
+                    "            ) ORDER BY r.resource_kind, r.resource_id) "
+                    "            FROM legal_hold_resources r "
+                    "            WHERE r.hold_id = h.hold_id),"
+                    "           '[]'::json"
+                    "       ) AS resources "
+                    "FROM legal_holds h "
+                    "WHERE h.tenant_id=%s AND h.released_at IS NULL "
+                    "ORDER BY h.created_at DESC",
                     (tenant_id,),
                 )
             else:
                 cur.execute(
-                    "SELECT * FROM legal_holds WHERE tenant_id=%s ORDER BY created_at DESC",
+                    "SELECT h.*, "
+                    "       COALESCE("
+                    "           (SELECT json_agg(json_build_object("
+                    "                'resource_kind', r.resource_kind,"
+                    "                'resource_id', r.resource_id"
+                    "            ) ORDER BY r.resource_kind, r.resource_id) "
+                    "            FROM legal_hold_resources r "
+                    "            WHERE r.hold_id = h.hold_id),"
+                    "           '[]'::json"
+                    "       ) AS resources "
+                    "FROM legal_holds h "
+                    "WHERE h.tenant_id=%s "
+                    "ORDER BY h.created_at DESC",
                     (tenant_id,),
                 )
-            return list(cur.fetchall())
+            rows = list(cur.fetchall())
+        # Flatten the resources list into two parallel lists
+        # for the legacy callers.
+        import json as _json
+
+        for r in rows:
+            res = r.pop("resources", None)
+            if res is None:
+                r["resource_kind"] = []
+                r["resource_id"] = []
+                continue
+            if isinstance(res, str):
+                res = _json.loads(res)
+            kinds = [item["resource_kind"] for item in res]
+            ids = [item["resource_id"] for item in res]
+            r["resource_kind"] = kinds
+            r["resource_id"] = ids
+        return rows
 
     def is_resource_held(
         self, tenant_id: str, resource_kind: ResourceKind, resource_id: str
@@ -1154,3 +1230,128 @@ class EventStore:
                     (tenant_id, state.value),
                 )
             return list(cur.fetchall())
+
+    # -- M24 DLM-001 — redaction primitives used by LifecycleManager --------
+
+    def redact_event_payload(self, tenant_id: str, event_id: str) -> bool:
+        """Replace ``events.payload`` with ``{"redacted": true}`` (ADR-0014).
+
+        The audit row stays — the event is part of the permanent
+        audit trail, but the payload it carried is replaced with
+        a sentinel. Returns True if a row was updated.
+
+        Tenant scope is enforced by the lifecycle manager
+        (the caller cross-checks before calling). The
+        ``task_runs.tenant_id`` column is nullable in the M0
+        schema; the JOIN-clause approach would silently miss
+        events whose task is un-tenant-scoped, so we update
+        by ``event_id`` alone and rely on the manager's gate.
+        """
+        import json as _json
+
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE events
+                SET payload = %s::jsonb
+                WHERE event_id = %s
+                """,
+                (_json.dumps({"redacted": True}), event_id),
+            )
+            return cur.rowcount > 0
+
+    def list_events_for_resource(
+        self, tenant_id: str, *, task_run_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """M24 — list events scoped to a tenant. Used by the
+        event redaction adapter to find every event whose
+        payload references a given resource (e.g. a receipt
+        id or an artifact id). The dev path filters by
+        ``task_run_id``; the production swap walks a
+        ``payload @> {"resource_id": ...}`` JSONB index.
+
+        The tenant scope uses a LEFT JOIN on
+        ``task_runs.tenant_id`` so we don't silently miss
+        events whose task row was created by the M0
+        EventStore (which leaves ``tenant_id`` NULL). The
+        M6 store back-fills ``tenant_id`` so the same
+        query works against multi-tenant data.
+        """
+        import json as _json
+
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            if task_run_id is not None:
+                cur.execute(
+                    """
+                    SELECT e.*
+                    FROM events e
+                    LEFT JOIN task_runs t ON t.task_run_id = e.task_run_id
+                    WHERE (t.tenant_id IS NULL OR t.tenant_id = %s)
+                      AND e.task_run_id = %s
+                    ORDER BY e.seq ASC
+                    """,
+                    (tenant_id, task_run_id),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT e.*
+                    FROM events e
+                    LEFT JOIN task_runs t ON t.task_run_id = e.task_run_id
+                    WHERE (t.tenant_id IS NULL OR t.tenant_id = %s)
+                    ORDER BY e.occurred_at DESC
+                    """,
+                    (tenant_id,),
+                )
+            rows = list(cur.fetchall())
+        for r in rows:
+            if isinstance(r.get("payload"), str):
+                r["payload"] = _json.loads(r["payload"])
+        return rows
+
+    def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM receipts WHERE receipt_id=%s", (receipt_id,)
+            )
+            return cur.fetchone()
+
+    def delete_receipt(self, receipt_id: str) -> bool:
+        """Hard-delete a receipt row. The events table keeps
+        its own row (the audit trail is permanent) but the
+        ``receipt.signed`` event's payload is replaced with
+        ``{"redacted": true}`` by the caller.
+        """
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                "DELETE FROM receipts WHERE receipt_id=%s", (receipt_id,)
+            )
+            return cur.rowcount > 0
+
+    def find_receipts_for_resource(
+        self, tenant_id: str, resource_id: str
+    ) -> list[dict[str, Any]]:
+        """Find receipts whose envelope (or related task) ties
+        them to a given resource. The dev path matches
+        receipts where ``node_id`` or the envelope's body
+        contains the resource id; production swaps for a
+        dedicated ``receipt_resources`` join table.
+        """
+        import json as _json
+
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT r.*
+                FROM receipts r
+                JOIN task_runs t ON t.task_run_id = r.task_run_id
+                WHERE t.tenant_id = %s
+                  AND (r.node_id = %s OR r.envelope::text LIKE %s)
+                """,
+                (tenant_id, resource_id, f"%{resource_id}%"),
+            )
+            rows = list(cur.fetchall())
+        for r in rows:
+            if isinstance(r.get("envelope"), str):
+                r["envelope"] = _json.loads(r["envelope"])
+        return rows

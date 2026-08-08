@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, Header, HTTPException, Response
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -69,6 +69,14 @@ class AppState:
     # every audit event here in addition to the EventStore so
     # a partner's SSE subscription sees the timeline live.
     event_bus: Any = None  # EventBus | None
+    # M24 — approval + break-glass services (ADR-0013 / 0012).
+    # The Coordinator consults these to write the persistent
+    # approval row; the admin endpoints use them to drive
+    # approve / revoke / sweep. ``tenant_id`` is the scope the
+    # default approval handler binds approvals to.
+    approval_service: Any = None  # ApprovalService | None
+    break_glass_service: Any = None  # BreakGlassService | None
+    tenant_id: str | None = None
 
 
 def _default_data_label() -> SecurityLabel:
@@ -286,17 +294,62 @@ def create_app(state: AppState | None = None) -> FastAPI:
     ux_router = build_ux_router(state_provider=lambda: state)
     app.include_router(ux_router)
 
+    # M24 DLM-001 — build the LifecycleManager eagerly so the UX
+    # Legal Hold page (which reaches into ``state._lifecycle_manager``
+    # at request time) sees a wired manager. The wiring is
+    # idempotent: a later admin endpoint would reuse the same
+    # instance via the ``hasattr`` guard below.
+    if not hasattr(state, "_lifecycle_manager"):
+        from orchestra.enterprise.lifecycle import (
+            InMemoryDevArtifactStore,
+            LifecycleManager,
+        )
+
+        artifact_store = getattr(state, "_dev_artifact_store", None)
+        if artifact_store is None:
+            artifact_store = InMemoryDevArtifactStore()
+            state._dev_artifact_store = artifact_store
+        webhook_history = getattr(state, "webhook_history", None)
+
+        def _delete_webhook(delivery_id: str) -> bool:
+            if webhook_history is None:
+                return False
+            for tid, recs in list(webhook_history._by_task.items()):  # type: ignore[attr-defined]
+                for r in list(recs):
+                    if r.delivery_id == delivery_id:
+                        recs.remove(r)
+                        return True
+            return False
+
+        def _webhook_exists(delivery_id: str) -> bool:
+            if webhook_history is None:
+                return False
+            for tid, recs in webhook_history._by_task.items():  # type: ignore[attr-defined]
+                for r in recs:
+                    if r.delivery_id == delivery_id:
+                        return True
+            return False
+
+        state._lifecycle_manager = LifecycleManager(
+            store=state.store,
+            artifact_store=artifact_store,
+            webhook_deleter=_delete_webhook if webhook_history is not None else None,
+            webhook_lookup=_webhook_exists if webhook_history is not None else None,
+        )
+
     # M16 — standard error envelope (RFC 7807 Problem Details). Every
     # 4xx and 5xx response carries the same shape; partners parse it
     # once and turn each error into a typed exception. The handlers
     # run on the M9 request-id contextvar so the ``instance`` field
     # points at a real log line.
     from fastapi.exceptions import RequestValidationError
+    from orchestra.api.admin_lifecycle import build_admin_lifecycle_router
     from orchestra.api.errors import (
         PROBLEM_JSON,
         problem_from_http_exception,
     )
     from orchestra.core.logging import current_request_id
+    from orchestra.enterprise.lifecycle import LifecycleManager
 
     @app.exception_handler(HTTPException)
     async def _http_exception_handler(request, exc: HTTPException):  # noqa: ARG001
@@ -841,11 +894,6 @@ def create_app(state: AppState | None = None) -> FastAPI:
     # ------------------------------------------------------------------
     # M4 INT-AH-001 — AgenticHub HTTP shape
     # ------------------------------------------------------------------
-    # The AgenticHub Adapter (orchestra/agentichub/client.py) speaks a
-    # different URL shape (``/api/v1/orchestra/...``) so the same
-    # Orchestra server can serve Dify and AgenticHub on one port. The
-    # handlers are thin proxies to the same Coordinator / EventStore
-    # the JSON API uses — there is no second source of truth.
 
     @app.post(
         "/api/v1/orchestra/submit",
@@ -1222,6 +1270,171 @@ def create_app(state: AppState | None = None) -> FastAPI:
             "error": delivery.error,
         }
 
+    # ------------------------------------------------------------------
+    # M24 SEC-001 / SEC-002 — Break-glass admin endpoints (ADR-0012)
+    # ------------------------------------------------------------------
+    # Identity is taken from the ``X-Orchestra-Actor`` header (dev
+    # path). Production swaps the header for a verified OIDC claim
+    # (§4.2 of pilot-readiness.md). The actor's tenant_id is the
+    # request's ``tenant_id`` field; cross-tenant calls are denied
+    # at the service layer.
+
+    def _bg_actor(header_value: str | None, body_value: Any) -> str:
+        v = (header_value or body_value or "console-user")
+        return v or "console-user"
+
+    @app.post(
+        "/admin/breakglass",
+        summary="Create a break-glass request",
+        tags=["Admin"],
+    )
+    def admin_breakglass_request(
+        body: dict,
+        x_orchestra_actor: str | None = Header(default=None, alias="X-Orchestra-Actor"),
+    ) -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        tenant_id = body.get("tenant_id")
+        if not tenant_id or not isinstance(tenant_id, str):
+            raise HTTPException(422, "tenant_id must be a non-empty string")
+        purpose = body.get("purpose")
+        if not purpose or not isinstance(purpose, str):
+            raise HTTPException(422, "purpose must be a non-empty string")
+        effect = body.get("effect") or {}
+        resource_scope = body.get("resource_scope") or {}
+        if not isinstance(effect, dict):
+            raise HTTPException(422, "effect must be a dict")
+        if not isinstance(resource_scope, dict):
+            raise HTTPException(422, "resource_scope must be a dict")
+        requested_by = _bg_actor(x_orchestra_actor, body.get("requested_by"))
+        try:
+            req = state.break_glass_service.request(
+                tenant_id=tenant_id,
+                purpose=purpose,
+                effect=effect,
+                resource_scope=resource_scope,
+                requested_by=requested_by,
+                ticket=body.get("ticket"),
+                window_seconds=body.get("window_seconds"),
+                task_run_id=body.get("task_run_id"),
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, str(e))
+        return req.model_dump(mode="json")
+
+    @app.get(
+        "/admin/breakglass",
+        summary="List break-glass requests for a tenant",
+        tags=["Admin"],
+    )
+    def admin_breakglass_list(
+        tenant_id: str,
+        state_filter: str | None = None,
+    ) -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        rows = state.break_glass_service.list_for_tenant(tenant_id, state=state_filter)
+        return {"tenant_id": tenant_id, "count": len(rows), "requests": rows}
+
+    @app.get(
+        "/admin/breakglass/{request_id}",
+        summary="Get a break-glass request by id",
+        tags=["Admin"],
+    )
+    def admin_breakglass_get(request_id: str) -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        row = state.break_glass_service.get(request_id)
+        if row is None:
+            raise HTTPException(404, f"break-glass request {request_id} not found")
+        return row
+
+    @app.post(
+        "/admin/breakglass/{request_id}/approve",
+        summary="Sign a break-glass request (1 of 2)",
+        tags=["Admin"],
+    )
+    def admin_breakglass_approve(
+        request_id: str,
+        body: dict | None = None,
+        x_orchestra_actor: str | None = Header(default=None, alias="X-Orchestra-Actor"),
+    ) -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        body = body or {}
+        approver = _bg_actor(x_orchestra_actor, body.get("approver"))
+        # Identity tenant comes from the request row (the service
+        # cross-checks it). We pass the request row's tenant_id
+        # because the admin caller is presumed to be acting on
+        # behalf of that tenant.
+        row = state.break_glass_service.get(request_id)
+        if row is None:
+            raise HTTPException(404, f"break-glass request {request_id} not found")
+        identity_tenant = row.get("tenant_id")
+        result = state.break_glass_service.approve(
+            request_id=request_id,
+            approver=approver,
+            identity_tenant_id=identity_tenant,
+            rationale=body.get("rationale", ""),
+        )
+        if not result.get("applied"):
+            reason = result.get("reason", "rejected")
+            raise HTTPException(409, f"approval not applied: {reason}")
+        return result
+
+    @app.post(
+        "/admin/breakglass/{request_id}/revoke",
+        summary="Revoke a break-glass request",
+        tags=["Admin"],
+    )
+    def admin_breakglass_revoke(
+        request_id: str,
+        body: dict | None = None,
+        x_orchestra_actor: str | None = Header(default=None, alias="X-Orchestra-Actor"),
+    ) -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        body = body or {}
+        revoker = _bg_actor(x_orchestra_actor, body.get("revoker"))
+        row = state.break_glass_service.get(request_id)
+        if row is None:
+            raise HTTPException(404, f"break-glass request {request_id} not found")
+        identity_tenant = row.get("tenant_id")
+        result = state.break_glass_service.revoke(
+            request_id=request_id,
+            revoker=revoker,
+            identity_tenant_id=identity_tenant,
+            reason=body.get("reason", ""),
+        )
+        if not result.get("applied"):
+            reason = result.get("reason", "rejected")
+            status = 409 if reason == "already_terminal" else 404
+            raise HTTPException(status, f"revoke not applied: {reason}")
+        return result
+
+    @app.post(
+        "/admin/breakglass/sweep",
+        summary="Sweep expired break-glass requests",
+        tags=["Admin"],
+    )
+    def admin_breakglass_sweep() -> dict:
+        if state.break_glass_service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        ids = state.break_glass_service.sweep_expired()
+        return {"expired_count": len(ids), "expired_ids": ids}
+
+    # ------------------------------------------------------------------
+    # M24 DLM-001 — Retention + Legal Hold admin (ADR-0014)
+    # ------------------------------------------------------------------
+    # The LifecycleManager is built earlier (right after the
+    # UX router is mounted) so the Legal Hold page sees a
+    # wired instance on first request. Here we just expose
+    # the admin endpoints.
+    lifecycle_router = build_admin_lifecycle_router(
+        manager_provider=lambda: state._lifecycle_manager
+    )
+    app.include_router(lifecycle_router)
+
     return app
 
 
@@ -1249,11 +1462,35 @@ def _bootstrap_default_state() -> AppState:
     # the Coordinator can publish into it from the first
     # ``_emit`` call.
     event_bus = EventBus()
-    coordinator = build_default_coordinator(store=store, endpoints=endpoints, event_bus=event_bus)
+    # M24 — wire the persistent-approval + break-glass services
+    # (ADR-0013 / ADR-0012). The Coordinator consumes them via
+    # its constructor; the admin endpoints consume them
+    # directly. The default tenant scope is ``tenant:demo``
+    # because the demo Console runs single-tenant; production
+    # pulls the scope from the request context.
+    from orchestra.enterprise.approval import ApprovalService
+    from orchestra.enterprise.break_glass import BreakGlassService
+
+    default_tenant = os.environ.get("ORCHESTRA_DEFAULT_TENANT", "tenant:demo")
+    approval_service = ApprovalService(store=store)
+    break_glass_service = BreakGlassService(store=store)
+    coordinator = build_default_coordinator(
+        store=store,
+        endpoints=endpoints,
+        event_bus=event_bus,
+        tenant_id=default_tenant,
+        approval_service=approval_service,
+        break_glass_service=break_glass_service,
+    )
     runner = BenchmarkRunner(
         store=store,
         coordinator_factory=lambda: build_default_coordinator(
-            store=store, endpoints=endpoints, event_bus=event_bus
+            store=store,
+            endpoints=endpoints,
+            event_bus=event_bus,
+            tenant_id=default_tenant,
+            approval_service=approval_service,
+            break_glass_service=break_glass_service,
         ),
     )
     # M14 — wire a per-tenant token-bucket rate limiter. The dev
@@ -1282,6 +1519,9 @@ def _bootstrap_default_state() -> AppState:
         webhook_dispatcher=WebhookDispatcher(),
         webhook_history=DeliveryHistory(),
         event_bus=event_bus,
+        approval_service=approval_service,
+        break_glass_service=break_glass_service,
+        tenant_id=default_tenant,
     )
 
 

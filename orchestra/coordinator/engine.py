@@ -23,6 +23,17 @@ through the PEP first. The PEP replaces the inputs with the projected
 payload (only the FieldManifest's allowed_fields, after redactions) and
 the audit timeline records an ``io.sent`` event with the projected
 digest — never the raw payload.
+
+M24 — persistent approval workflow (ADR-0013). The default
+``_default_approval_handler`` now uses the
+:class:`orchestra.enterprise.approval.ApprovalService` to write a
+pending approval row to PG, then waits on the in-process
+:class:`asyncio.Event` as a wake-up cache. On startup
+:meth:`_reload_pending_approvals` re-attaches the wake-up events for
+any pending rows so a process restart mid-task does not silently drop
+the approval. Custom ``approval_handler`` callables injected by tests
+keep working unchanged — the new behaviour is in the default handler
+only.
 """
 
 from __future__ import annotations
@@ -91,6 +102,9 @@ class Coordinator:
         approval_handler: ApprovalHandler | None = None,
         egress_pep: EgressPEP | None = None,
         event_bus: Any = None,
+        tenant_id: str | None = None,
+        approval_service: Any = None,
+        break_glass_service: Any = None,
     ) -> None:
         self._store = store
         self._router = router
@@ -98,8 +112,14 @@ class Coordinator:
         self._grant_issuer = grant_issuer
         self._receipt_builder = receipt_builder
         # Internal approval gate: an asyncio.Event the default handler waits
-        # on. ``decide_approval`` sets it.
-        self._approval_events: dict[tuple[str, str], tuple[asyncio.Event, dict[str, Any]]] = {}
+        # on. ``decide_approval`` sets it. The tuple is
+        # ``(event, payload)`` where ``payload`` carries the
+        # ``approval_id`` once the persistent row exists, so
+        # ``decide_approval`` can route the decision through the
+        # store's atomic CAS.
+        self._approval_events: dict[
+            tuple[str, str], tuple[asyncio.Event, dict[str, Any]]
+        ] = {}
         self._approval_handler = approval_handler or self._default_approval_handler
         # ``run()`` stashes the original initial_inputs here so the
         # in-process "ingest_contract" node can re-derive the contract
@@ -114,6 +134,23 @@ class Coordinator:
         # adapter call through the EgressPEP. Local tools, sinks, and
         # in-process nodes never see the PEP.
         self._egress_pep: EgressPEP | None = egress_pep
+        # M24 — the tenant scope. When set, the default approval
+        # handler writes a row to the persistent approvals table
+        # so the engine can recover from a process restart.
+        self._tenant_id: str | None = tenant_id
+        # M24 — services are optional. When not provided, the
+        # default approval handler degrades to the in-process
+        # asyncio.Event only (the pre-M24 behaviour). Production
+        # callers always pass them in.
+        self._approval_service = approval_service
+        self._break_glass_service = break_glass_service
+        # M24 — re-attach the asyncio.Event wake-up handles to any
+        # approvals that were in-flight when the process last
+        # died. This is the "service restart" path. The reload
+        # is best-effort: a DB blip or missing service leaves the
+        # in-process cache empty, and the next pending approval
+        # will populate it normally.
+        self._reload_pending_approvals()
 
     # ------------------------------------------------------------------
     # Public API
@@ -381,16 +418,56 @@ class Coordinator:
     ) -> None:
         """Resolve a pending human approval. Call from the API/UI when
         a human clicks approve/reject.
+
+        M24 — when an :class:`ApprovalService` was injected and a
+        persistent row was created (the default path), this routes
+        the decision through the store's atomic CAS. The legacy
+        in-memory path is preserved for callers that never set up
+        a persistent row (e.g. tests that pass a custom
+        ``approval_handler`` or that didn't supply a tenant).
         """
         key = (task_run_id, node_id)
         if key not in self._approval_events:
             raise OrchestraError(f"no pending approval for {key}")
         event, request_payload = self._approval_events[key]
+
+        approval_id = request_payload.get("approval_id")
+        if (
+            self._approval_service is not None
+            and approval_id
+            and self._tenant_id
+        ):
+            # Persistent path (ADR-0013). The atomic CAS in
+            # ``record_approval_decision`` is the source of truth;
+            # we mirror the result into the in-process payload so
+            # the awaiting coroutine sees the same decision shape.
+            cas = self._approval_service.decide(
+                approval_id=approval_id,
+                decision=decision,
+                decided_by=decided_by,
+                identity_tenant_id=self._tenant_id,
+                rationale=rationale,
+            )
+            if not cas.get("applied"):
+                # The row is already terminal (concurrent decision
+                # from another API instance) or the identity is
+                # wrong. Don't wake the engine on a stale call —
+                # the OTHER decision is the one the engine will see.
+                return
+            request_payload["decision"] = decision
+            request_payload["decided_by"] = decided_by
+            request_payload["decided_at"] = utc_now_iso()
+            request_payload["rationale"] = rationale
+            request_payload["version"] = cas.get("version")
+            event.set()
+            return
+
+        # Legacy in-memory path. Persist via the original
+        # ``save_approval`` (M0..M23 behaviour) and wake the event.
         request_payload["decision"] = decision
         request_payload["decided_by"] = decided_by
         request_payload["decided_at"] = utc_now_iso()
         request_payload["rationale"] = rationale
-        # Persist the approval record.
         self._store.save_approval(
             {
                 "approval_id": new_id(),
@@ -758,7 +835,10 @@ class Coordinator:
     async def _default_approval_handler(
         self, task_run_id: str, node_id: str, request_payload: dict[str, Any]
     ) -> dict[str, Any]:
-        # Public API path: wait for decide_approval().
+        # Public API path: register a pending approval row in PG
+        # (when an ApprovalService is wired) and wait on the
+        # in-process asyncio.Event. The row is the source of
+        # truth; the event is a wake-up cache.
         event = asyncio.Event()
         bucket: dict[str, Any] = {
             "requested_at": utc_now_iso(),
@@ -768,23 +848,85 @@ class Coordinator:
                 k: v for k, v in request_payload.items() if isinstance(v, (str, int, float, bool))
             },
         }
+
+        approval_id: str | None = None
+        if self._approval_service is not None and self._tenant_id:
+            try:
+                row = self._approval_service.create_for_node(
+                    task_run_id=task_run_id,
+                    node_id=node_id,
+                    tenant_id=self._tenant_id,
+                    requested_by="engine",
+                )
+                approval_id = row.approval_id
+                bucket["approval_id"] = approval_id
+            except Exception:  # noqa: BLE001
+                # PG hiccup — fall back to the in-memory path
+                # (the legacy ``save_approval`` keeps the audit
+                # trail working even when the persistent row
+                # can't be created).
+                approval_id = None
+
         self._approval_events[(task_run_id, node_id)] = (event, bucket)
-        self._store.save_approval(
-            {
-                "approval_id": new_id(),
-                "task_run_id": task_run_id,
-                "node_id": node_id,
-                "requested_at": bucket["requested_at"],
-            }
-        )
+        if approval_id is None:
+            # Legacy path — write the original ``save_approval``
+            # row so older consumers / dashboards that read the
+            # approvals table directly keep working.
+            self._store.save_approval(
+                {
+                    "approval_id": new_id(),
+                    "task_run_id": task_run_id,
+                    "node_id": node_id,
+                    "requested_at": bucket["requested_at"],
+                }
+            )
         self._emit(
             task_run_id=task_run_id,
             node_run_id=None,
             kind=EventKind.NODE_AWAITING_APPROVAL,
-            payload={"node_id": node_id},
+            payload={"node_id": node_id, "approval_id": approval_id},
         )
         await event.wait()
         return bucket
+
+    def _reload_pending_approvals(self) -> None:
+        """Re-attach asyncio.Event wake-up handles for any
+        approval row that was pending when the process last died.
+
+        ADR-0013 §"Restart guarantee": on every ``Coordinator``
+        construction we re-issue the in-process event for each
+        ``state='pending'`` row so the engine can re-await the
+        decision. The reload is best-effort: a missing service
+        or a DB error just means the in-process cache is empty,
+        and the next ``_default_approval_handler`` call will
+        populate it normally.
+        """
+        if self._approval_service is None or not self._tenant_id:
+            return
+        try:
+            rows = self._approval_service.reload_pending_for_tenant(
+                self._tenant_id
+            )
+        except Exception:  # noqa: BLE001
+            return
+        for row in rows:
+            key = (row.get("task_run_id", ""), row.get("node_id", ""))
+            if not key[0] or not key[1]:
+                continue
+            if key in self._approval_events:
+                continue
+            event = asyncio.Event()
+            self._approval_events[key] = (
+                event,
+                {
+                    "requested_at": str(row.get("requested_at", utc_now_iso())),
+                    "task_run_id": key[0],
+                    "node_id": key[1],
+                    "request": {},
+                    "approval_id": row.get("approval_id"),
+                    "reloaded": True,
+                },
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1013,9 @@ def build_default_coordinator(
     endpoints: dict[str, str] | None = None,
     egress_pep: EgressPEP | None = None,
     event_bus: Any = None,
+    tenant_id: str | None = None,
+    approval_service: Any = None,
+    break_glass_service: Any = None,
 ) -> Coordinator:
     """Construct a Coordinator with the default registry, policy, and
     four reference Adapters.
@@ -889,6 +1034,11 @@ def build_default_coordinator(
     inputs through the PEP before invocation. ``None`` disables
     projection (the P0/P2 default for tests that only care about
     routing).
+
+    ``tenant_id``, ``approval_service``, ``break_glass_service`` are
+    M24 wiring (ADR-0013 / ADR-0012). When provided, the default
+    approval handler writes a persistent row to PG and re-attaches
+    pending rows on restart.
     """
     from orchestra.registry.bootstrap import load_default_manifests as _load
 
@@ -911,6 +1061,9 @@ def build_default_coordinator(
         receipt_builder=receipt_builder,
         egress_pep=egress_pep,
         event_bus=event_bus,
+        tenant_id=tenant_id,
+        approval_service=approval_service,
+        break_glass_service=break_glass_service,
     )
 
 

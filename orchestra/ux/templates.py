@@ -1211,3 +1211,256 @@ def render_security_view(
 </section>
 <span data-sse-url="/tasks/{_esc(task_run_id)}/events/stream" hidden></span>
 """
+
+
+# ---------------------------------------------------------------------------
+# M24 SEC-001 — Break-glass Security Center (ADR-0012)
+# ---------------------------------------------------------------------------
+
+
+def render_break_glass_view(
+    *,
+    requests: list[dict[str, Any]],
+    tenant_id: str,
+    actor: str,
+    csrf_token: str = "",
+) -> str:
+    """Security Center tab for break-glass.
+
+    Two sections: a "Request" form (so a SRE can file a new
+    request from the console) and a table of recent requests
+    with Approve / Revoke buttons. The form is intentionally
+    minimal: a free-form purpose + the two JSON blobs the
+    backend validates. The buttons post to the same admin
+    endpoints the CLI calls; the response is rendered in a
+    standard redirect so the user sees the updated state.
+    """
+    rows: list[str] = []
+    for r in requests:
+        rid = r.get("request_id", "")
+        state = r.get("state", "")
+        purpose = r.get("purpose", "")
+        requested_by = r.get("requested_by", "")
+        ticket = r.get("ticket") or "—"
+        created = str(r.get("requested_at", ""))[:19]
+        first = r.get("first_approver") or "—"
+        second = r.get("second_approver") or "—"
+        expires = str(r.get("expires_at", ""))[:19] or "—"
+        action_buttons = ""
+        if state == "requested":
+            action_buttons = (
+                f'<form method="post" action="/ux/security/breakglass/{_esc(rid)}/approve" style="display:inline">'
+                f'<input type="hidden" name="actor" value="{_esc(actor)}" />'
+                f'<button type="submit" class="btn">Sign as approver</button>'
+                f"</form>"
+            )
+        elif state == "first-approved":
+            action_buttons = (
+                f'<form method="post" action="/ux/security/breakglass/{_esc(rid)}/approve" style="display:inline">'
+                f'<input type="hidden" name="actor" value="{_esc(actor)}" />'
+                f'<button type="submit" class="btn">Second signature</button>'
+                f"</form>"
+                f'<form method="post" action="/ux/security/breakglass/{_esc(rid)}/revoke" style="display:inline">'
+                f'<input type="hidden" name="actor" value="{_esc(actor)}" />'
+                f'<button type="submit" class="btn warn">Revoke</button>'
+                f"</form>"
+            )
+        elif state == "active":
+            action_buttons = (
+                f'<form method="post" action="/ux/security/breakglass/{_esc(rid)}/revoke" style="display:inline">'
+                f'<input type="hidden" name="actor" value="{_esc(actor)}" />'
+                f'<button type="submit" class="btn warn">Revoke</button>'
+                f"</form>"
+            )
+        rows.append(
+            f"<tr>"
+            f"<td><code>{_esc(rid[:16])}…</code></td>"
+            f"<td>{_pill_for_state(state)}</td>"
+            f"<td>{_esc(purpose)}</td>"
+            f"<td>{_esc(ticket)}</td>"
+            f"<td>{_esc(requested_by)}</td>"
+            f"<td>{_esc(first)} / {_esc(second)}</td>"
+            f"<td class='muted'>{_esc(expires)}</td>"
+            f"<td class='muted'>{_esc(created)}</td>"
+            f"<td>{action_buttons}</td>"
+            f"</tr>"
+        )
+
+    return f"""
+<section class="card" data-test="breakglass-request-form">
+  <h2>Request break-glass</h2>
+  <p class="muted">
+    Two distinct approvers are required. The applicant cannot be
+    an approver. The window is clamped to the tenant's max and
+    the 4-hour hard cap.
+  </p>
+  <form method="post" action="/ux/security/breakglass/new">
+    <label>Tenant
+      <input name="tenant_id" value="{_esc(tenant_id)}" required />
+    </label>
+    <label>Purpose (incident id / short text)
+      <input name="purpose" placeholder="e.g. INC-2026-08-08" required />
+    </label>
+    <label>Ticket (optional)
+      <input name="ticket" placeholder="external case id" />
+    </label>
+    <label>Effect (JSON object)
+      <textarea name="effect" rows="3"
+        placeholder='{{"kind":"override_egress_view","view":"egress.internal"}}'>{{"kind":"override_egress_view","view":"egress.internal"}}</textarea>
+    </label>
+    <label>Resource scope (JSON object)
+      <textarea name="resource_scope" rows="2"
+        placeholder='{{"resource_kind":"artifact","resource_id":"art-1"}}'>{{"resource_kind":"artifact","resource_id":"art-1"}}</textarea>
+    </label>
+    <label>Window (seconds; clamped)
+      <input name="window_seconds" type="number" min="1" max="14400" value="900" />
+    </label>
+    <label>Applicant
+      <input name="actor" value="{_esc(actor)}" required />
+    </label>
+    <button type="submit">Submit request</button>
+  </form>
+</section>
+<section class="card" data-test="breakglass-list">
+  <h2>Break-glass requests — <code>{_esc(tenant_id)}</code></h2>
+  <p class="muted">
+    {len(requests)} request(s) ·
+    <a href="/ux/security/breakglass/sweep">sweep expired →</a>
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>request_id</th><th>state</th><th>purpose</th><th>ticket</th>
+        <th>requested_by</th><th>approvers</th><th>expires_at</th>
+        <th>created</th><th>actions</th>
+      </tr></thead>
+      <tbody>
+        {''.join(rows) or '<tr><td colspan="9" class="empty">no break-glass requests</td></tr>'}
+      </tbody>
+    </table>
+  </div>
+</section>
+"""
+
+
+# ---------------------------------------------------------------------------
+# M24 DLM-001 — Legal Hold Center (ADR-0014)
+# ---------------------------------------------------------------------------
+
+
+def render_legal_hold_view(
+    *,
+    tenant_id: str,
+    active_holds: list[dict[str, Any]],
+    resource_kinds: list[str],
+    message: str | None = None,
+    error: str | None = None,
+) -> str:
+    """The Security Center Legal Hold tab.
+
+    Shows a list of active holds for the demo tenant + a
+    "Create hold" form + a "Release" button per active
+    hold. The page is single-tenant in the dev path; the
+    production swap pulls the tenant from the request
+    context.
+
+    ``active_holds`` is a list of dicts as returned by
+    :meth:`LifecycleManager.list_holds`. ``resource_kinds``
+    is the list of valid resource kinds (for the form's
+    select widget).
+    """
+    rows = []
+    for h in active_holds:
+        hold_id = h.get("hold_id", "")
+        case_id = h.get("case_id", "")
+        reason = h.get("reason", "")
+        created_by = h.get("created_by", "")
+        created_at = str(h.get("created_at", ""))[:19]
+        rids = h.get("resource_id", []) or []
+        rkind_list = h.get("resource_kind", []) or []
+        resources = ", ".join(f"{k}:{r}" for k, r in zip(rkind_list, rids)) or (
+            "tenant-wide (no specific resources)"
+        )
+        rows.append(
+            f"""<tr data-test="legal-hold-row">
+  <td><code>{_esc(hold_id[:14])}…</code><button class="copy-btn" data-copy="{_esc(hold_id)}" type="button">copy</button></td>
+  <td><strong>{_esc(case_id)}</strong></td>
+  <td>{_esc(reason)}</td>
+  <td><code>{_esc(created_by)}</code></td>
+  <td class="muted">{_esc(created_at)}</td>
+  <td><span class="pill">{_esc(resources)}</span></td>
+  <td>
+    <form method="post" action="/security/legal-hold/release" data-test="release-form" style="display:inline;">
+      <input type="hidden" name="hold_id" value="{_esc(hold_id)}" />
+      <input type="text" name="reason" placeholder="release reason" />
+      <button type="submit">Release</button>
+    </form>
+  </td>
+</tr>"""
+        )
+    rows_html = "".join(rows) or (
+        '<tr><td colspan="7" class="empty">No active holds. The default policy '
+        "retains every resource; a Legal Hold is only needed when a regulator "
+        "asks to freeze a specific case.</td></tr>"
+    )
+    options = "\n".join(
+        f'<option value="{_esc(k)}">{_esc(k)}</option>' for k in resource_kinds
+    )
+    flash_html = ""
+    if error:
+        flash_html = (
+            f'<div class="card" style="border-left:4px solid var(--err);" '
+            f'data-test="legal-hold-error"><strong>Error:</strong> {_esc(error)}</div>'
+        )
+    elif message:
+        flash_html = (
+            f'<div class="card" style="border-left:4px solid var(--ok);" '
+            f'data-test="legal-hold-message"><strong>OK:</strong> {_esc(message)}</div>'
+        )
+    return f"""
+<section class="card">
+  <h2>Legal Hold Center</h2>
+  <p class="lead">
+    A Legal Hold freezes deletion for a specific resource (or for the whole tenant).
+    Every <code>POST /admin/deletion-jobs</code> call is checked against the
+    active holds first; a matching hold raises <code>LifecycleBlocked</code> and
+    the deletion transitions to <code>state='held'</code>. Release a hold to
+    allow the deletion to proceed.
+  </p>
+  <p class="muted">Tenant scope: <code>{_esc(tenant_id)}</code> · the dev path is single-tenant; production pulls the scope from the request context.</p>
+  {flash_html}
+</section>
+<section class="card">
+  <h2>Create Legal Hold</h2>
+  <form method="post" action="/security/legal-hold/create" data-test="create-form">
+    <label>Case ID <input name="case_id" required placeholder="e.g. CASE-2026-001" /></label>
+    <label>Reason <input name="reason" required placeholder="e.g. regulator freeze" /></label>
+    <label>Created by <input name="created_by" value="console-user" /></label>
+    <label>Resource kind (optional)
+      <select name="resource_kind">
+        <option value="">(tenant-wide)</option>
+        {options}
+      </select>
+    </label>
+    <label>Resource id (optional, pairs with the kind above)
+      <input name="resource_id" placeholder="e.g. art-001" />
+    </label>
+    <button type="submit">Create hold</button>
+  </form>
+</section>
+<section class="card">
+  <h2>Active Holds</h2>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>hold_id</th><th>case</th><th>reason</th><th>by</th>
+          <th>created</th><th>resources</th><th></th>
+        </tr>
+      </thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+  </div>
+</section>
+"""
+

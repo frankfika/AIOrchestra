@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from orchestra.ux.templates import (
     render_business_view,
     render_layout,
+    render_legal_hold_view,
     render_platform_view,
     render_recent_tasks,
     render_security_view,
@@ -340,6 +341,157 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
     # ------------------------------------------------------------------
 
     @router.get(
+        "/security/legal-hold",
+        response_class=HTMLResponse,
+        summary="Security Center — Legal Holds (ADR-0014)",
+        tags=["UX"],
+    )
+    async def legal_hold_hub(
+        message: str | None = Query(default=None),
+        error: str | None = Query(default=None),
+    ) -> HTMLResponse:
+        """M24 DLM-001 — Legal Hold hub page.
+
+        Lists active holds for the demo tenant + a "Create
+        hold" form + a "Release" button per row. The page
+        is mounted at ``/security/legal-hold`` so the
+        existing ``/security/{task_run_id}`` route (which
+        catches any unrecognised suffix) is preserved.
+        """
+        state = _state()
+        # M24 — the dev path is single-tenant; the page
+        # always shows the demo tenant. The production
+        # swap pulls the tenant from the request context.
+        tenant_id = "tenant:demo"
+        mgr = getattr(state, "_lifecycle_manager", None)
+        if mgr is None:
+            # The app didn't wire the manager (e.g. a
+            # caller passed in a custom AppState that
+            # doesn't include one). We render an
+            # explanatory card instead of crashing.
+            body = f"""
+<section class="card">
+  <h2>Legal Hold Center</h2>
+  <p class="empty"><span class="icon">⚠️</span>The LifecycleManager is not wired on this app state. Construct the app via <code>create_app()</code> to enable the Legal Hold UI.</p>
+</section>
+"""
+            return HTMLResponse(
+                render_layout(
+                    role="security",
+                    title="Legal Hold Center",
+                    body_html=body,
+                    current_path="/security/legal-hold",
+                )
+            )
+        try:
+            holds = mgr.list_holds(tenant_id, active_only=True)
+        except Exception as e:  # noqa: BLE001
+            holds = []
+            error = f"failed to list holds: {e!s}"
+        from orchestra.core.schema import ResourceKind
+
+        kinds = [k.value for k in ResourceKind]
+        body = render_legal_hold_view(
+            tenant_id=tenant_id,
+            active_holds=holds,
+            resource_kinds=kinds,
+            message=message,
+            error=error,
+        )
+        return HTMLResponse(
+            render_layout(
+                role="security",
+                title="Legal Hold Center",
+                body_html=body,
+                current_path="/security/legal-hold",
+            )
+        )
+
+    @router.post(
+        "/security/legal-hold/create",
+        summary="Create a Legal Hold (HTML form)",
+        tags=["UX"],
+    )
+    async def legal_hold_create_form(
+        case_id: str = Form(...),
+        reason: str = Form(...),
+        created_by: str = Form("console-user"),
+        resource_kind: str = Form(""),
+        resource_id: str = Form(""),
+    ) -> RedirectResponse:
+        """Form action: create a hold and redirect back to
+        the hub with a flash message.
+        """
+        state = _state()
+        tenant_id = "tenant:demo"
+        mgr = getattr(state, "_lifecycle_manager", None)
+        if mgr is None:
+            return RedirectResponse(
+                url="/security/legal-hold?error=manager+not+wired",
+                status_code=303,
+            )
+        # Parse the optional resource pair.
+        rk_list: list[str] | None = None
+        rid_list: list[str] | None = None
+        if resource_kind and resource_id:
+            rk_list = [resource_kind]
+            rid_list = [resource_id]
+        try:
+            from orchestra.core.schema import ResourceKind
+
+            rk_enum = [ResourceKind(rk_list[0])] if rk_list else None
+            mgr.create_hold(
+                tenant_id=tenant_id,
+                case_id=case_id,
+                reason=reason,
+                created_by=created_by or "console-user",
+                resource_kinds=rk_enum,
+                resource_ids=rid_list,
+            )
+        except Exception as e:  # noqa: BLE001
+            return RedirectResponse(
+                url=f"/security/legal-hold?error={e!s}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=f"/security/legal-hold?message=created+hold+{case_id}",
+            status_code=303,
+        )
+
+    @router.post(
+        "/security/legal-hold/release",
+        summary="Release a Legal Hold (HTML form)",
+        tags=["UX"],
+    )
+    async def legal_hold_release_form(
+        hold_id: str = Form(...),
+        reason: str = Form(""),
+    ) -> RedirectResponse:
+        state = _state()
+        mgr = getattr(state, "_lifecycle_manager", None)
+        if mgr is None:
+            return RedirectResponse(
+                url="/security/legal-hold?error=manager+not+wired",
+                status_code=303,
+            )
+        try:
+            mgr.release_hold(
+                hold_id=hold_id,
+                released_by="console-user",
+                identity_tenant_id="tenant:demo",
+                reason=reason or "released from console",
+            )
+        except Exception as e:  # noqa: BLE001
+            return RedirectResponse(
+                url=f"/security/legal-hold?error={e!s}",
+                status_code=303,
+            )
+        return RedirectResponse(
+            url=f"/security/legal-hold?message=released+hold+{hold_id[:12]}",
+            status_code=303,
+        )
+
+    @router.get(
         "/security/{task_run_id}",
         response_class=HTMLResponse,
         summary="Security View (Audit Timeline + Receipts)",
@@ -435,6 +587,163 @@ def build_ux_router(*, state_provider: Callable[[], Any]) -> APIRouter:
         return JSONResponse(
             [m.model_dump(mode="json") for m in state.coordinator.list_capabilities()]
         )
+
+    # ------------------------------------------------------------------
+    # M24 SEC-001 — Break-glass Security Center (ADR-0012)
+    # ------------------------------------------------------------------
+    # The Security Center tab. Lists active / recent break-glass
+    # requests for a tenant, has a "Request" form, and Approve /
+    # Revoke buttons that hit the same admin endpoints the CLI uses.
+
+    def _bg_actor_for_ux(request: Request) -> str:
+        # Dev path: the X-Orchestra-Actor header or a query
+        # string. Production swaps to a verified OIDC claim
+        # (pilot-readiness.md §4.2).
+        return (
+            request.headers.get("x-orchestra-actor")
+            or request.query_params.get("actor")
+            or "console-user"
+        )
+
+    @router.get(
+        "/security/breakglass",
+        response_class=HTMLResponse,
+        summary="Break-glass Security Center (list + request form)",
+        tags=["UX"],
+    )
+    async def break_glass_center(
+        request: Request,
+        tenant_id: str | None = Query(default=None),
+        state_filter: str | None = Query(default=None, alias="state"),
+    ) -> HTMLResponse:
+        state = _state()
+        service = getattr(state, "break_glass_service", None)
+        scope_tenant = tenant_id or getattr(state, "tenant_id", None) or "tenant:demo"
+        actor = _bg_actor_for_ux(request)
+        rows: list[dict[str, Any]] = []
+        if service is not None:
+            rows = service.list_for_tenant(scope_tenant, state=state_filter)
+        from orchestra.ux.templates import render_break_glass_view
+
+        body = render_break_glass_view(
+            requests=rows,
+            tenant_id=scope_tenant,
+            actor=actor,
+        )
+        return HTMLResponse(
+            render_layout(
+                role="security",
+                title="Break-glass",
+                body_html=body,
+                current_path="/security/breakglass",
+            )
+        )
+
+    @router.post(
+        "/ux/security/breakglass/new",
+        summary="Submit a break-glass request from the console",
+        tags=["UX"],
+    )
+    async def break_glass_request_form(
+        tenant_id: str = Form(...),
+        purpose: str = Form(...),
+        effect: str = Form("{}"),
+        resource_scope: str = Form("{}"),
+        ticket: str = Form(""),
+        window_seconds: int | None = Form(default=None),
+        actor: str = Form("console-user"),
+    ):
+        state = _state()
+        service = getattr(state, "break_glass_service", None)
+        if service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        import json as _json
+
+        try:
+            effect_obj = _json.loads(effect) if effect else {}
+        except _json.JSONDecodeError as e:
+            raise HTTPException(400, f"effect must be valid JSON: {e}")
+        try:
+            scope_obj = _json.loads(resource_scope) if resource_scope else {}
+        except _json.JSONDecodeError as e:
+            raise HTTPException(400, f"resource_scope must be valid JSON: {e}")
+        try:
+            service.request(
+                tenant_id=tenant_id,
+                purpose=purpose,
+                effect=effect_obj,
+                resource_scope=scope_obj,
+                requested_by=actor or "console-user",
+                ticket=ticket or None,
+                window_seconds=window_seconds,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, str(e))
+        return RedirectResponse(url="/security/breakglass", status_code=303)
+
+    @router.post(
+        "/ux/security/breakglass/{request_id}/approve",
+        summary="Sign a break-glass request from the console",
+        tags=["UX"],
+    )
+    async def break_glass_approve_form(
+        request_id: str, actor: str = Form("console-user"), rationale: str = Form("")
+    ):
+        state = _state()
+        service = getattr(state, "break_glass_service", None)
+        if service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        row = service.get(request_id)
+        if row is None:
+            raise HTTPException(404, "break-glass request not found")
+        result = service.approve(
+            request_id=request_id,
+            approver=actor or "console-user",
+            identity_tenant_id=row.get("tenant_id"),
+            rationale=rationale or "",
+        )
+        if not result.get("applied"):
+            raise HTTPException(409, f"approval not applied: {result.get('reason')}")
+        return RedirectResponse(url="/security/breakglass", status_code=303)
+
+    @router.post(
+        "/ux/security/breakglass/{request_id}/revoke",
+        summary="Revoke a break-glass request from the console",
+        tags=["UX"],
+    )
+    async def break_glass_revoke_form(
+        request_id: str, actor: str = Form("console-user"), reason: str = Form("")
+    ):
+        state = _state()
+        service = getattr(state, "break_glass_service", None)
+        if service is None:
+            raise HTTPException(503, "break-glass service not initialised")
+        row = service.get(request_id)
+        if row is None:
+            raise HTTPException(404, "break-glass request not found")
+        result = service.revoke(
+            request_id=request_id,
+            revoker=actor or "console-user",
+            identity_tenant_id=row.get("tenant_id"),
+            reason=reason or "",
+        )
+        if not result.get("applied"):
+            raise HTTPException(
+                409, f"revoke not applied: {result.get('reason')}"
+            )
+        return RedirectResponse(url="/security/breakglass", status_code=303)
+
+    @router.get(
+        "/ux/security/breakglass/sweep",
+        summary="Sweep expired break-glass requests (console shortcut)",
+        tags=["UX"],
+    )
+    async def break_glass_sweep_redirect() -> RedirectResponse:
+        state = _state()
+        service = getattr(state, "break_glass_service", None)
+        if service is not None:
+            service.sweep_expired()
+        return RedirectResponse(url="/security/breakglass", status_code=303)
 
     # ------------------------------------------------------------------
     # Helpers used by templates.render_recent_tasks
