@@ -464,6 +464,20 @@ class EventKind(str, Enum):
     GRANT_ISSUED = "grant.issued"
     RECEIPT_SIGNED = "receipt.signed"
     FALLBACK_TRIGGERED = "fallback.triggered"
+    # M24 — Break-glass lifecycle (ADR-0012)
+    BREAK_GLASS_REQUESTED = "break_glass.requested"
+    BREAK_GLASS_FIRST_APPROVED = "break_glass.first_approved"
+    BREAK_GLASS_ACTIVE = "break_glass.active"
+    BREAK_GLASS_EXPIRED = "break_glass.expired"
+    BREAK_GLASS_REVOKED = "break_glass.revoked"
+    # M24 — Legal Hold lifecycle (ADR-0014)
+    HOLD_CREATED = "hold.created"
+    HOLD_RELEASED = "hold.released"
+    DELETION_REQUESTED = "deletion.requested"
+    DELETION_COMPLETED = "deletion.completed"
+    DELETION_PARTIAL = "deletion.partial"
+    DELETION_BLOCKED = "deletion.blocked"
+    DELETION_FAILED = "deletion.failed"
 
 
 class AuditEvent(BaseModel):
@@ -691,6 +705,236 @@ class CitationManifest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# M24 — Break-glass (ADR-0012) and Persistent Approval (ADR-0013)
+# ---------------------------------------------------------------------------
+
+
+class BreakGlassState(str, Enum):
+    """Finite state machine for a Break-glass request.
+
+    Transitions (ADR-0012):
+        requested → first-approved → active → expired
+                                          ↘ revoked
+        requested → first-approved → revoked
+    """
+
+    REQUESTED = "requested"
+    FIRST_APPROVED = "first-approved"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    REVOKED = "revoked"
+
+
+class BreakGlassRequest(BaseModel):
+    """A two-person, time-bounded override of a policy ceiling.
+
+    ADR-0012. The request carries the structured ``Effect`` that the
+    approvers are allowing. The ``BreakGlassService`` enforces the
+    effect ceiling at runtime (no label downgrade, no Zero-Egress
+    bypass, no Egress PEP bypass, no tenant isolation bypass).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str = Field(default_factory=lambda: f"bg:{new_id()[:12]}")
+    tenant_id: str
+    task_run_id: str | None = None
+    purpose: str
+    effect: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured Effect payload the break-glass is asking for",
+    )
+    resource_scope: dict[str, Any] = Field(
+        default_factory=dict,
+        description="{resource_kind, resource_id, [additional filters]}",
+    )
+    ticket: str | None = Field(default=None, description="external ticket / case id")
+    requested_by: str
+    requested_at: str = Field(default_factory=utc_now_iso)
+    state: BreakGlassState = BreakGlassState.REQUESTED
+    first_approver: str | None = None
+    first_approved_at: str | None = None
+    second_approver: str | None = None
+    second_approved_at: str | None = None
+    window_seconds: int = 900  # 15-minute default
+    activated_at: str | None = None
+    expires_at: str | None = None
+    revoked_by: str | None = None
+    revoked_at: str | None = None
+    revoke_reason: str | None = None
+
+
+class ApprovalState(str, Enum):
+    """State for the persistent approval workflow (ADR-0013).
+
+    Business approvals move pending → approved or pending → rejected
+    atomically. Break-glass approvals move pending → first-approved →
+    approved (the final transition is from the second approver, not
+    a state machine inside the same row).
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    EXPIRED = "expired"
+    FIRST_APPROVED = "first-approved"  # break-glass only
+
+
+class ApprovalRecord(BaseModel):
+    """Persistent approval record (ADR-0013).
+
+    PG is the source of truth. The engine's in-process asyncio.Event
+    is a wake-up cache; the row is what the API reads.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approval_id: str = Field(default_factory=lambda: f"apv:{new_id()[:12]}")
+    task_run_id: str
+    node_id: str
+    tenant_id: str
+    version: int = 0
+    state: ApprovalState = ApprovalState.PENDING
+    required_approvers: int = 1
+    requested_at: str = Field(default_factory=utc_now_iso)
+    requested_by: str
+    ticket: str | None = None
+    decided_at: str | None = None
+    decision_payload: dict[str, Any] | None = None
+
+
+class ApprovalDecision(BaseModel):
+    """One row in the append-only approver log (ADR-0013)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_id: str = Field(default_factory=lambda: f"apvd:{new_id()[:12]}")
+    approval_id: str
+    decision_seq: int  # 1, 2, ...
+    decided_by: str
+    decided_at: str = Field(default_factory=utc_now_iso)
+    decision: Literal["approve", "reject"]
+    rationale: str = ""
+    identity_tenant_id: str  # must match ApprovalRecord.tenant_id
+
+
+# ---------------------------------------------------------------------------
+# M24 — Retention and Legal Hold (ADR-0014)
+# ---------------------------------------------------------------------------
+
+
+class ResourceKind(str, Enum):
+    """Kinds of resource covered by a LifecyclePolicy / LegalHold."""
+
+    ARTIFACT = "artifact"
+    RECEIPT = "receipt"
+    EVENT = "event"
+    WEBHOOK = "webhook"
+    CACHE = "cache"
+    BACKUP = "backup"
+
+
+class DeletionState(str, Enum):
+    """State for an idempotent DeletionJob (ADR-0014)."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    DELETED = "deleted"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    HELD = "held"  # blocked by a Legal Hold
+
+
+class LifecyclePolicy(BaseModel):
+    """What to keep, for how long, for which resource kind.
+
+    ADR-0014. A tenant defines one policy per resource kind. When
+    ``auto_delete`` is True and a resource is older than
+    ``retention_seconds``, the LifecycleSweeper is allowed to
+    create a DeletionJob for it. When False, the resource is
+    retained indefinitely (or until a Legal Hold / explicit
+    delete).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy_id: str = Field(default_factory=lambda: f"pol:{new_id()[:12]}")
+    tenant_id: str
+    resource_kind: ResourceKind
+    retention_seconds: int
+    auto_delete: bool = False
+    created_at: str = Field(default_factory=utc_now_iso)
+
+
+class LegalHold(BaseModel):
+    """An absolute, tenant-scoped freeze on deletion (ADR-0014).
+
+    While a hold is active, every delete attempt on a resource in
+    ``legal_hold_resources`` is denied. A hold is released by an
+    authenticated user with the legal_hold_releaser role.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    hold_id: str = Field(default_factory=lambda: f"hold:{new_id()[:12]}")
+    tenant_id: str
+    case_id: str
+    reason: str
+    created_at: str = Field(default_factory=utc_now_iso)
+    created_by: str
+    released_at: str | None = None
+    released_by: str | None = None
+    release_reason: str | None = None
+    # Resources covered by the hold. A hold without resources is
+    # valid — it freezes all deletion for the tenant.
+    resource_kinds: list[ResourceKind] = Field(default_factory=list)
+    resource_ids: list[str] = Field(default_factory=list)
+
+
+class DeletionEvidence(BaseModel):
+    """Per-job record of what was deleted and what remained.
+
+    ADR-0014. The evidence is the only output of a successful
+    DeletionJob. It contains the deletion_id, the per-copy
+    status, and a digest of the deleted payload. The evidence
+    row itself is never deleted (the audit trail is permanent).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deletion_id: str = Field(default_factory=lambda: f"del:{new_id()[:12]}")
+    copies_deleted: int = 0
+    copies_kept: int = 0
+    kept_resources: list[dict[str, str]] = Field(default_factory=list)
+    payload_digest: str | None = None
+    completed_at: str = Field(default_factory=utc_now_iso)
+
+
+class DeletionJob(BaseModel):
+    """An idempotent, retryable unit of deletion work (ADR-0014).
+
+    A unique index on (tenant_id, resource_kind, resource_id)
+    makes LifecycleManager.delete() idempotent — a second call
+    returns the same job rather than creating a new one.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    job_id: str = Field(default_factory=lambda: f"dj:{new_id()[:12]}")
+    tenant_id: str
+    resource_kind: ResourceKind
+    resource_id: str
+    state: DeletionState = DeletionState.PENDING
+    attempt: int = 0
+    max_attempts: int = 3
+    requested_at: str = Field(default_factory=utc_now_iso)
+    requested_by: str
+    completed_at: str | None = None
+    last_error: str | None = None
+    evidence: DeletionEvidence | None = None
+
+
+# ---------------------------------------------------------------------------
 # M0 export helper
 # ---------------------------------------------------------------------------
 
@@ -728,6 +972,13 @@ def export_json_schemas() -> dict[str, Any]:
         FieldManifest,
         Citation,
         CitationManifest,
+        # M24 — Break-glass + Persistent approval + Retention / Legal Hold
+        BreakGlassRequest,
+        ApprovalRecord,
+        ApprovalDecision,
+        LifecyclePolicy,
+        LegalHold,
+        DeletionJob,
     ]
     out: dict[str, Any] = {}
     for t in types:

@@ -32,6 +32,9 @@ M20 (SSE streaming).
 | [0009](0009-error-envelope-rfc-7807.md) | Error envelope is RFC 7807 Problem Details | M16 |
 | [0010](0010-webhook-hmac-stripe-style.md) | Webhook delivery is HMAC-SHA-256 signed, Stripe-style | M17, M19 |
 | [0011](0011-sse-per-task-in-memory-bus.md) | SSE streaming is a per-task in-memory bus with replay | M20 |
+| [0012](0012-break-glass-two-person-control.md) | Break-glass uses two-person control with a bounded time window | M24 SEC-001 |
+| [0013](0013-persistent-approval-workflow.md) | Approval workflow is persisted in PostgreSQL with version-stamped atomic CAS | M24 SEC-002 |
+| [0014](0014-retention-and-legal-hold.md) | Retention + Legal Hold: deletion is an idempotent lifecycle task; holds are absolute | M24 DLM-001 |
 
 ## How to use this
 

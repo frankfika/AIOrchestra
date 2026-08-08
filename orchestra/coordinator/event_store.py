@@ -29,7 +29,21 @@ import psycopg
 from psycopg.rows import dict_row
 
 from orchestra.core.errors import OrchestraError
-from orchestra.core.schema import AuditEvent, NodeRunState, SignedReceipt, TaskRunState
+from orchestra.core.ids import new_id
+from orchestra.core.schema import (
+    ApprovalRecord,
+    AuditEvent,
+    BreakGlassRequest,
+    BreakGlassState,
+    DeletionJob,
+    DeletionState,
+    LegalHold,
+    LifecyclePolicy,
+    NodeRunState,
+    ResourceKind,
+    SignedReceipt,
+    TaskRunState,
+)
 
 DEFAULT_DSN = "postgresql://orchestra:orchestra@127.0.0.1:5432/orchestra"
 
@@ -108,6 +122,116 @@ CREATE TABLE IF NOT EXISTS approvals (
     decided_by    TEXT,
     rationale     TEXT DEFAULT ''
 );
+-- M24 — Persistent approval workflow (ADR-0013): add columns to
+-- ``approvals`` for tenant scoping, version-stamped atomic CAS,
+-- two-person control, and identity binding. ``ADD COLUMN IF NOT
+-- EXISTS`` keeps existing installs working.
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS tenant_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS version BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'pending';
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS required_approvers INT NOT NULL DEFAULT 1;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS requested_by TEXT NOT NULL DEFAULT '';
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS ticket TEXT;
+ALTER TABLE approvals ADD COLUMN IF NOT EXISTS decision_payload JSONB;
+-- M24: keep the index non-unique to avoid conflicts with legacy
+-- rows that pre-date M24. Uniqueness is enforced at the
+-- application layer (engine._approval_events + create_approval's
+-- ON CONFLICT clause).
+CREATE INDEX IF NOT EXISTS approvals_task_node ON approvals(task_run_id, node_id);
+CREATE INDEX IF NOT EXISTS approvals_state ON approvals(state) WHERE state = 'pending';
+
+-- M24 — Append-only approver log (ADR-0013). One row per
+-- approve/reject decision; for break-glass there are two rows
+-- per approval. ``UNIQUE (approval_id, decision_seq)`` makes the
+-- second approver's race atomic.
+CREATE TABLE IF NOT EXISTS approval_decisions (
+    decision_id     TEXT PRIMARY KEY,
+    approval_id     TEXT NOT NULL REFERENCES approvals(approval_id) ON DELETE CASCADE,
+    decision_seq    INT NOT NULL,
+    decided_by      TEXT NOT NULL,
+    decided_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    decision        TEXT NOT NULL,
+    rationale       TEXT DEFAULT '',
+    identity_tenant TEXT NOT NULL DEFAULT '',
+    UNIQUE (approval_id, decision_seq)
+);
+
+-- M24 — Break-glass requests (ADR-0012).
+CREATE TABLE IF NOT EXISTS break_glass_requests (
+    request_id        TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL,
+    task_run_id       TEXT,
+    purpose           TEXT NOT NULL,
+    effect            JSONB NOT NULL,
+    resource_scope    JSONB NOT NULL,
+    ticket            TEXT,
+    requested_by      TEXT NOT NULL,
+    requested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    state             TEXT NOT NULL DEFAULT 'requested',
+    first_approver    TEXT,
+    first_approved_at TIMESTAMPTZ,
+    second_approver   TEXT,
+    second_approved_at TIMESTAMPTZ,
+    window_seconds    INT NOT NULL DEFAULT 900,
+    activated_at      TIMESTAMPTZ,
+    expires_at        TIMESTAMPTZ,
+    revoked_by        TEXT,
+    revoked_at        TIMESTAMPTZ,
+    revoke_reason     TEXT
+);
+CREATE INDEX IF NOT EXISTS break_glass_state ON break_glass_requests(state) WHERE state IN ('requested', 'first-approved', 'active');
+CREATE INDEX IF NOT EXISTS break_glass_tenant ON break_glass_requests(tenant_id, requested_at DESC);
+
+-- M24 — Retention and Legal Hold (ADR-0014).
+CREATE TABLE IF NOT EXISTS lifecycle_policies (
+    policy_id         TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL,
+    resource_kind     TEXT NOT NULL,
+    retention_seconds BIGINT NOT NULL,
+    auto_delete       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (tenant_id, resource_kind)
+);
+
+CREATE TABLE IF NOT EXISTS legal_holds (
+    hold_id        TEXT PRIMARY KEY,
+    tenant_id      TEXT NOT NULL,
+    case_id        TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    created_by     TEXT NOT NULL,
+    released_at    TIMESTAMPTZ,
+    released_by    TEXT,
+    release_reason TEXT,
+    UNIQUE (tenant_id, case_id)
+);
+CREATE INDEX IF NOT EXISTS legal_holds_tenant ON legal_holds(tenant_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS legal_hold_resources (
+    hold_id        TEXT NOT NULL REFERENCES legal_holds(hold_id) ON DELETE CASCADE,
+    resource_kind  TEXT NOT NULL,
+    resource_id    TEXT NOT NULL,
+    PRIMARY KEY (hold_id, resource_kind, resource_id)
+);
+CREATE INDEX IF NOT EXISTS legal_hold_resources_lookup ON legal_hold_resources(resource_kind, resource_id);
+
+CREATE TABLE IF NOT EXISTS deletion_jobs (
+    job_id            TEXT PRIMARY KEY,
+    tenant_id         TEXT NOT NULL,
+    resource_kind     TEXT NOT NULL,
+    resource_id       TEXT NOT NULL,
+    state             TEXT NOT NULL DEFAULT 'pending',
+    attempt           INT NOT NULL DEFAULT 0,
+    max_attempts      INT NOT NULL DEFAULT 3,
+    requested_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    requested_by      TEXT NOT NULL,
+    completed_at      TIMESTAMPTZ,
+    last_error        TEXT,
+    deletion_evidence JSONB,
+    UNIQUE (tenant_id, resource_kind, resource_id)
+);
+CREATE INDEX IF NOT EXISTS deletion_jobs_state ON deletion_jobs(state) WHERE state IN ('pending', 'running', 'partial');
+CREATE INDEX IF NOT EXISTS deletion_jobs_tenant ON deletion_jobs(tenant_id, requested_at DESC);
 """
 
 
@@ -427,3 +551,606 @@ class EventStore:
                 (task_run_id,),
             )
             return cur.fetchall()
+
+    # -- M24 — Persistent approval workflow (ADR-0013) --------------------
+
+    def create_approval(
+        self,
+        *,
+        task_run_id: str,
+        node_id: str,
+        tenant_id: str,
+        requested_by: str,
+        required_approvers: int = 1,
+        ticket: str | None = None,
+    ) -> ApprovalRecord:
+        """Create a pending ApprovalRecord. Idempotent on
+        (task_run_id, node_id): re-creating for the same gate
+        returns the existing row.
+        """
+        import json as _json
+
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO approvals
+                  (approval_id, task_run_id, node_id, tenant_id, version,
+                   state, required_approvers, requested_at, requested_by, ticket)
+                VALUES (%s, %s, %s, %s, 0, 'pending', %s, now(), %s, %s)
+                ON CONFLICT (task_run_id, node_id) DO UPDATE
+                  SET state = approvals.state
+                RETURNING *
+                """,
+                (
+                    f"apv:{new_id()[:12]}",
+                    task_run_id,
+                    node_id,
+                    tenant_id,
+                    int(required_approvers),
+                    requested_by,
+                    ticket,
+                ),
+            )
+            row = cur.fetchone()
+        # Coerce JSONB columns back to dicts for the response.
+        if isinstance(row.get("decision_payload"), str):
+            row["decision_payload"] = _json.loads(row["decision_payload"])
+        return ApprovalRecord.model_validate(row)
+
+    def record_approval_decision(
+        self,
+        *,
+        approval_id: str,
+        decision: str,  # "approve" | "reject"
+        decided_by: str,
+        identity_tenant_id: str,
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        """Atomically record a decision and update the parent
+        approval. The atomic compare-and-set is the production
+        guarantee from ADR-0013.
+
+        Returns a dict with:
+          - ``applied``: bool — True if this caller's decision
+            was the one that flipped the row.
+          - ``state``: the new approval state
+          - ``version``: the new version
+          - ``reason``: when not applied, why
+        """
+        import json as _json
+
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            # 1. Look up the current row to know required_approvers
+            #    and existing decisions.
+            cur.execute(
+                """
+                SELECT a.approval_id, a.tenant_id, a.state, a.required_approvers,
+                       a.version, a.decision_payload,
+                       (SELECT count(*) FROM approval_decisions d
+                         WHERE d.approval_id = a.approval_id) AS decisions_seen
+                FROM approvals a
+                WHERE a.approval_id = %s
+                FOR UPDATE
+                """,
+                (approval_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return {"applied": False, "reason": "not_found"}
+            if row["state"] not in ("pending", "first-approved"):
+                return {"applied": False, "reason": "already_terminal", "state": row["state"]}
+            if row["tenant_id"] != identity_tenant_id:
+                return {"applied": False, "reason": "cross_tenant"}
+            if decision not in ("approve", "reject"):
+                return {"applied": False, "reason": "bad_decision"}
+
+            seen = int(row["decisions_seen"])
+            new_seq = seen + 1
+
+            # 2. Insert the decision row (UNIQUE on (approval_id, decision_seq)
+            #    gives us the atomic guard).
+            cur.execute(
+                """
+                INSERT INTO approval_decisions
+                  (decision_id, approval_id, decision_seq, decided_by,
+                   decided_at, decision, rationale, identity_tenant)
+                VALUES (%s, %s, %s, %s, now(), %s, %s, %s)
+                """,
+                (
+                    f"apvd:{new_id()[:12]}",
+                    approval_id,
+                    new_seq,
+                    decided_by,
+                    decision,
+                    rationale,
+                    identity_tenant_id,
+                ),
+            )
+
+            # 3. Compute the new approval state.
+            required = int(row["required_approvers"])
+            if decision == "reject":
+                new_state = "rejected"
+            elif required == 1:
+                new_state = "approved"
+            elif required == 2 and new_seq == 1:
+                new_state = "first-approved"
+            elif required == 2 and new_seq >= 2:
+                # Defensive: required_approvers > 2 is not supported.
+                new_state = "approved"
+            else:
+                new_state = row["state"]
+
+            new_payload = {"decision": decision, "by": decided_by, "rationale": rationale}
+
+            cur.execute(
+                """
+                UPDATE approvals
+                SET state = %s,
+                    decided_at = now(),
+                    decision_payload = %s::jsonb,
+                    version = version + 1
+                WHERE approval_id = %s
+                RETURNING state, version
+                """,
+                (new_state, _json.dumps(new_payload), approval_id),
+            )
+            updated = cur.fetchone()
+            return {
+                "applied": True,
+                "state": updated["state"],
+                "version": int(updated["version"]),
+                "decisions_seen": new_seq,
+                "required_approvers": required,
+            }
+
+    def get_approval(self, approval_id: str) -> dict[str, Any] | None:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM approvals WHERE approval_id=%s", (approval_id,)
+            )
+            return cur.fetchone()
+
+    def list_approvals_for_tenant(
+        self, tenant_id: str, *, state: str | None = None
+    ) -> list[dict[str, Any]]:
+        """List pending (or terminal) approvals for a tenant.
+        Used by the engine to reload pending approvals on startup.
+        """
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            if state is None:
+                cur.execute(
+                    "SELECT * FROM approvals WHERE tenant_id=%s ORDER BY requested_at",
+                    (tenant_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM approvals WHERE tenant_id=%s AND state=%s ORDER BY requested_at",
+                    (tenant_id, state),
+                )
+            return list(cur.fetchall())
+
+    def list_approval_decisions(self, approval_id: str) -> list[dict[str, Any]]:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM approval_decisions WHERE approval_id=%s ORDER BY decision_seq",
+                (approval_id,),
+            )
+            return list(cur.fetchall())
+
+    # -- M24 — Break-glass (ADR-0012) ---------------------------------------
+
+    def create_break_glass_request(self, req: BreakGlassRequest) -> BreakGlassRequest:
+        import json as _json
+
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO break_glass_requests
+                  (request_id, tenant_id, task_run_id, purpose, effect,
+                   resource_scope, ticket, requested_by, requested_at,
+                   state, window_seconds)
+                VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, now(),
+                        'requested', %s)
+                """,
+                (
+                    req.request_id,
+                    req.tenant_id,
+                    req.task_run_id,
+                    req.purpose,
+                    _json.dumps(req.effect),
+                    _json.dumps(req.resource_scope),
+                    req.ticket,
+                    req.requested_by,
+                    int(req.window_seconds),
+                ),
+            )
+        return req
+
+    def get_break_glass(self, request_id: str) -> dict[str, Any] | None:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM break_glass_requests WHERE request_id=%s",
+                (request_id,),
+            )
+            return cur.fetchone()
+
+    def list_break_glass_for_tenant(
+        self, tenant_id: str, *, state: str | None = None
+    ) -> list[dict[str, Any]]:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            if state is None:
+                cur.execute(
+                    "SELECT * FROM break_glass_requests WHERE tenant_id=%s "
+                    "ORDER BY requested_at DESC",
+                    (tenant_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM break_glass_requests WHERE tenant_id=%s "
+                    "AND state=%s ORDER BY requested_at DESC",
+                    (tenant_id, state),
+                )
+            return list(cur.fetchall())
+
+    def record_break_glass_approval(
+        self,
+        *,
+        request_id: str,
+        approver: str,
+        identity_tenant_id: str,
+    ) -> dict[str, Any]:
+        """Atomically transition requested → first-approved → active.
+
+        The applicant cannot be the approver. The two approvers must
+        be distinct identities. Cross-tenant is denied.
+        """
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT request_id, tenant_id, state, requested_by,
+                       first_approver, window_seconds
+                FROM break_glass_requests
+                WHERE request_id = %s
+                FOR UPDATE
+                """,
+                (request_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return {"applied": False, "reason": "not_found"}
+            if row["tenant_id"] != identity_tenant_id:
+                return {"applied": False, "reason": "cross_tenant"}
+            if row["state"] not in ("requested", "first-approved"):
+                return {"applied": False, "reason": "not_approvable", "state": row["state"]}
+            if row["requested_by"] == approver:
+                return {"applied": False, "reason": "applicant_cannot_approve"}
+            if row["first_approver"] and row["first_approver"] == approver:
+                return {"applied": False, "reason": "already_approved_by_you"}
+
+            if row["state"] == "requested":
+                cur.execute(
+                    """
+                    UPDATE break_glass_requests
+                    SET state = 'first-approved',
+                        first_approver = %s,
+                        first_approved_at = now()
+                    WHERE request_id = %s
+                    """,
+                    (approver, request_id),
+                )
+                return {
+                    "applied": True,
+                    "state": "first-approved",
+                    "approver": approver,
+                    "required_next": "second_approver",
+                }
+            # second approver: activate
+            cur.execute(
+                """
+                UPDATE break_glass_requests
+                SET state = 'active',
+                    second_approver = %s,
+                    second_approved_at = now(),
+                    activated_at = now(),
+                    expires_at = now() + (window_seconds * interval '1 second')
+                WHERE request_id = %s
+                RETURNING expires_at
+                """,
+                (approver, request_id),
+            )
+            updated = cur.fetchone()
+            return {
+                "applied": True,
+                "state": "active",
+                "approver": approver,
+                "expires_at": str(updated["expires_at"]) if updated else None,
+            }
+
+    def revoke_break_glass(
+        self,
+        *,
+        request_id: str,
+        revoker: str,
+        identity_tenant_id: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Revoke a Break-glass request. Either approver or any
+        operator with kill-switch role can call this.
+        """
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                SELECT tenant_id, state FROM break_glass_requests
+                WHERE request_id = %s
+                FOR UPDATE
+                """,
+                (request_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return {"applied": False, "reason": "not_found"}
+            if row["tenant_id"] != identity_tenant_id:
+                return {"applied": False, "reason": "cross_tenant"}
+            if row["state"] in ("expired", "revoked"):
+                return {"applied": False, "reason": "already_terminal"}
+            cur.execute(
+                """
+                UPDATE break_glass_requests
+                SET state = 'revoked',
+                    revoked_by = %s,
+                    revoked_at = now(),
+                    revoke_reason = %s
+                WHERE request_id = %s
+                """,
+                (revoker, reason, request_id),
+            )
+            return {"applied": True, "state": "revoked"}
+
+    def sweep_expired_break_glass(self, now: str | None = None) -> list[str]:
+        """Mark any 'active' break-glass whose ``expires_at`` has
+        passed as 'expired'. Returns the list of freshly expired
+        request_ids. Idempotent.
+        """
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE break_glass_requests
+                SET state = 'expired'
+                WHERE state = 'active' AND expires_at IS NOT NULL
+                  AND expires_at < now()
+                RETURNING request_id
+                """
+            )
+            return [r[0] for r in cur.fetchall()]
+
+    # -- M24 — Retention and Legal Hold (ADR-0014) ------------------------
+
+    def upsert_lifecycle_policy(self, policy: LifecyclePolicy) -> None:
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO lifecycle_policies
+                  (policy_id, tenant_id, resource_kind, retention_seconds, auto_delete)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (tenant_id, resource_kind) DO UPDATE
+                  SET retention_seconds = EXCLUDED.retention_seconds,
+                      auto_delete = EXCLUDED.auto_delete
+                """,
+                (
+                    policy.policy_id,
+                    policy.tenant_id,
+                    policy.resource_kind.value,
+                    int(policy.retention_seconds),
+                    bool(policy.auto_delete),
+                ),
+            )
+
+    def get_lifecycle_policy(
+        self, tenant_id: str, resource_kind: ResourceKind
+    ) -> dict[str, Any] | None:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT * FROM lifecycle_policies "
+                "WHERE tenant_id=%s AND resource_kind=%s",
+                (tenant_id, resource_kind.value),
+            )
+            return cur.fetchone()
+
+    def create_legal_hold(
+        self,
+        hold: LegalHold,
+        *,
+        resource_pairs: list[tuple[ResourceKind, str]] | None = None,
+    ) -> LegalHold:
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO legal_holds
+                  (hold_id, tenant_id, case_id, reason, created_at, created_by)
+                VALUES (%s, %s, %s, %s, now(), %s)
+                """,
+                (hold.hold_id, hold.tenant_id, hold.case_id, hold.reason, hold.created_by),
+            )
+            if resource_pairs:
+                for kind, rid in resource_pairs:
+                    cur.execute(
+                        """
+                        INSERT INTO legal_hold_resources
+                          (hold_id, resource_kind, resource_id)
+                        VALUES (%s, %s, %s)
+                        """,
+                        (hold.hold_id, kind.value, rid),
+                    )
+        return hold
+
+    def release_legal_hold(
+        self,
+        *,
+        hold_id: str,
+        released_by: str,
+        identity_tenant_id: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                "SELECT tenant_id, released_at FROM legal_holds "
+                "WHERE hold_id = %s FOR UPDATE",
+                (hold_id,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                return {"applied": False, "reason": "not_found"}
+            if row["tenant_id"] != identity_tenant_id:
+                return {"applied": False, "reason": "cross_tenant"}
+            if row["released_at"] is not None:
+                return {"applied": False, "reason": "already_released"}
+            cur.execute(
+                """
+                UPDATE legal_holds
+                SET released_at = now(),
+                    released_by = %s,
+                    release_reason = %s
+                WHERE hold_id = %s
+                """,
+                (released_by, reason, hold_id),
+            )
+            return {"applied": True}
+
+    def list_legal_holds(
+        self, tenant_id: str, *, active_only: bool = True
+    ) -> list[dict[str, Any]]:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            if active_only:
+                cur.execute(
+                    "SELECT * FROM legal_holds WHERE tenant_id=%s AND released_at IS NULL "
+                    "ORDER BY created_at DESC",
+                    (tenant_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM legal_holds WHERE tenant_id=%s ORDER BY created_at DESC",
+                    (tenant_id,),
+                )
+            return list(cur.fetchall())
+
+    def is_resource_held(
+        self, tenant_id: str, resource_kind: ResourceKind, resource_id: str
+    ) -> bool:
+        """Return True if a Legal Hold currently covers this
+        resource. ``False`` means deletion is allowed (subject
+        to the lifecycle policy).
+        """
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                SELECT 1
+                FROM legal_holds h
+                JOIN legal_hold_resources r ON r.hold_id = h.hold_id
+                WHERE h.tenant_id = %s
+                  AND h.released_at IS NULL
+                  AND r.resource_kind = %s
+                  AND r.resource_id = %s
+                LIMIT 1
+                """,
+                (tenant_id, resource_kind.value, resource_id),
+            )
+            return cur.fetchone() is not None
+
+    def create_deletion_job(
+        self,
+        job: DeletionJob,
+    ) -> DeletionJob:
+        """Idempotent: UNIQUE (tenant_id, resource_kind, resource_id)."""
+        import json as _json
+
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                """
+                INSERT INTO deletion_jobs
+                  (job_id, tenant_id, resource_kind, resource_id, state,
+                   attempt, max_attempts, requested_at, requested_by)
+                VALUES (%s, %s, %s, %s, 'pending', 0, %s, now(), %s)
+                ON CONFLICT (tenant_id, resource_kind, resource_id) DO UPDATE
+                  SET state = deletion_jobs.state
+                RETURNING job_id, state, attempt
+                """,
+                (
+                    job.job_id,
+                    job.tenant_id,
+                    job.resource_kind.value,
+                    job.resource_id,
+                    int(job.max_attempts),
+                    job.requested_by,
+                ),
+            )
+            row = cur.fetchone()
+        # Return the existing or new job with the actual row state.
+        return DeletionJob(
+            job_id=row["job_id"],
+            tenant_id=job.tenant_id,
+            resource_kind=job.resource_kind,
+            resource_id=job.resource_id,
+            state=DeletionState(row["state"]),
+            attempt=int(row["attempt"]),
+            max_attempts=job.max_attempts,
+            requested_by=job.requested_by,
+        )
+
+    def update_deletion_job(
+        self,
+        *,
+        job_id: str,
+        state: DeletionState,
+        last_error: str | None = None,
+        evidence: dict[str, Any] | None = None,
+        increment_attempt: bool = False,
+    ) -> None:
+        import json as _json
+
+        with self._tx() as c, c.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE deletion_jobs
+                SET state = %s,
+                    attempt = attempt + %s,
+                    completed_at = CASE
+                        WHEN %s IN ('deleted', 'partial', 'failed', 'held') THEN now()
+                        ELSE completed_at
+                    END,
+                    last_error = COALESCE(%s, last_error),
+                    deletion_evidence = COALESCE(%s::jsonb, deletion_evidence)
+                WHERE job_id = %s
+                """,
+                (
+                    state.value,
+                    1 if increment_attempt else 0,
+                    state.value,
+                    last_error,
+                    _json.dumps(evidence) if evidence is not None else None,
+                    job_id,
+                ),
+            )
+
+    def get_deletion_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            cur.execute("SELECT * FROM deletion_jobs WHERE job_id=%s", (job_id,))
+            return cur.fetchone()
+
+    def list_deletion_jobs(
+        self, tenant_id: str, *, state: DeletionState | None = None
+    ) -> list[dict[str, Any]]:
+        with self._tx() as c, c.cursor(row_factory=dict_row) as cur:
+            if state is None:
+                cur.execute(
+                    "SELECT * FROM deletion_jobs WHERE tenant_id=%s "
+                    "ORDER BY requested_at DESC",
+                    (tenant_id,),
+                )
+            else:
+                cur.execute(
+                    "SELECT * FROM deletion_jobs WHERE tenant_id=%s AND state=%s "
+                    "ORDER BY requested_at DESC",
+                    (tenant_id, state.value),
+                )
+            return list(cur.fetchall())
